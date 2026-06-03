@@ -213,3 +213,8 @@ csrc/output/
 
 # claude code skills
 .claude/skills/*
+
+# SFA baseline goldens / excel artifacts (NPU-side runs)
+/tests/op_test/sparse_flash_attention/golden/
+/tests/op_test/sparse_flash_attention/excel/*.xlsx
+/tests/op_test/sparse_flash_attention/excel/*.pt
