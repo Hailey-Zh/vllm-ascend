@@ -60,8 +60,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
         }
     }
     auto lse_options = query.options().dtype(at::kFloat);
-    at::Tensor softmax_max = at::empty(lse_shape, lse_options);
-    at::Tensor softmax_sum = at::empty(lse_shape, lse_options);
+    // 用 zeros 而不是 empty：kernel 只写有效 (b, s1) 位置，padding 行（s1 >= actS1，
+    // 或 actS1=0 的整个 batch）不被写到，必须预先清零，否则 NPU 内存池的脏值会作为
+    // padding 暴露给调用方。ops-transformer arch22 在 kernel InitOutputSingleCore /
+    // InitAllZeroOutput 里清；vllm-ascend 用 host 端 zeros 等价，逻辑更集中。
+    at::Tensor softmax_max = at::zeros(lse_shape, lse_options);
+    at::Tensor softmax_sum = at::zeros(lse_shape, lse_options);
 
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
