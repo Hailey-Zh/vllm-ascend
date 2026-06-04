@@ -369,10 +369,15 @@ def convert_param_combination_to_cs_format(param_combination):
         "key_rope": q_dtype_str,
     }
     
+    # sparse_indices 上限：生产路径只产合法 block id（lightning_indexer 输出），不会出现非 -1 的负数。
+    # 取 [0, ceil(S2/sparse_block_size)] 保证全部生成合法 block id；
+    # CPU golden 用 PyTorch 负索引会回绕到末尾 token，与 kernel 的指针偏移不一致，
+    # 导致 LSE 精度对比挂掉（attn_out 因为聚合不敏感）。
+    sparse_blockcount_upper = max(1, int(math.ceil(S2 / sparse_block_size)))
     default_range_input = {
         "query": [-10.0, 100.0],
         "key": [5.0, 100.0],
-        "sparse_indices": [-10, 10],
+        "sparse_indices": [0, sparse_blockcount_upper - 1],
         "block_table": [0, 1],
         "query_rope": [-10.0, 10.0],
         "key_rope": [-10.0, 10.0],
