@@ -330,16 +330,6 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
                                                              LocalTensor<T> &softmaxSumUbSlice,
                                                              LocalTensor<T> &softmaxMaxUbSlice)
 {
-    // [DEBUG] 隔离测试 UB→GM 路径：
-    //   1) 在 outputBuff2 写已知序列 [10..80]
-    //   2) DataCopyPad 输出到 softmaxSumGm_[0]
-    //   3) softmaxMaxGm_ 仍用 InitOutput 写常量 99 作对照
-    // 期望 sm = [10,20,30,40,50,60,70,80], mx = [99,...,99]
-    // 若 sm 不对：DataCopyPad/同步本身有问题
-    // 若 sm 对：原 bug 在 softmaxSumUb 读位置错
-    matmul::InitOutput<T>(softmaxMaxGm_[0], 8, (T)99.0f);
-
-    // 恢复完整的原始实现：max 和 sum 都按 offset 写到正确位置。
     if (mSplitInfo.vecDealM == 0) {
         return;
     }
