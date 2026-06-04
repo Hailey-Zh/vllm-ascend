@@ -339,8 +339,7 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
     // 若 sm 对：原 bug 在 softmaxSumUb 读位置错
     matmul::InitOutput<T>(softmaxMaxGm_[0], 8, (T)99.0f);
 
-    // 恢复原始路径，但保留 mx=99 对照。
-    // 单行 case (B=1,S1=1,actS1=1) 时 offset=0，sm 应该看到 ~[1,2,3,...] 的 softmax max 值。
+    // 恢复完整的原始实现：max 和 sum 都按 offset 写到正确位置。
     if (mSplitInfo.vecDealM == 0) {
         return;
     }
@@ -371,6 +370,14 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
 
         LocalTensor<T> tmp = outputBuff2.Get<T>();
         WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+        DataCopy(tmp, softmaxMaxUbSlice[baseOffset], alignedSize);
+        SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+        WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+        DataCopyPad(softmaxMaxGm_[offset], tmp, dataCopyParams);
+        SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+
+        tmp = outputBuff2.Get<T>();
+        WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
         DataCopy(tmp, softmaxSumUbSlice[baseOffset], alignedSize);
         SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
         WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
@@ -378,6 +385,7 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
         SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
     } else {
         matmul::InitOutput<T>(softmaxSumGm_[offset], size, ConstInfo::FLOAT_ZERO);
+        matmul::InitOutput<T>(softmaxMaxGm_[offset], size, SOFTMAX_MIN_NUM);
     }
 }
 
