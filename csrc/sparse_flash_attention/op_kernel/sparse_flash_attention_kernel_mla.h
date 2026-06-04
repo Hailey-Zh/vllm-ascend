@@ -66,7 +66,9 @@ public:
                                 __gm__ uint8_t *sparseIndices, __gm__ uint8_t *actualSeqLengthsQ,
                                 __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *blockTable,
                                 __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
-                                __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+                                __gm__ uint8_t *attentionOut,
+                                __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+                                __gm__ uint8_t *workspace,
                                 const SparseFlashAttentionTilingDataMla *__restrict tiling,
 				                __gm__ uint8_t *gmTiling, TPipe *tPipe);
 
@@ -139,6 +141,8 @@ private:
     GlobalTensor<K_ROPE_T> kRopeGm;
 
     GlobalTensor<OUT_T> attentionOutGm;
+    GlobalTensor<T> softmaxMaxGm;
+    GlobalTensor<T> softmaxSumGm;
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topKGm;
 
@@ -378,7 +382,9 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
                        __gm__ uint8_t *sparseIndices, __gm__ uint8_t *actualSeqLengthsQ,
                        __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *blockTable,
                        __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
-                       __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+                       __gm__ uint8_t *attentionOut,
+                       __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+                       __gm__ uint8_t *workspace,
                        const SparseFlashAttentionTilingDataMla *__restrict tiling,
                        __gm__ uint8_t *gmTiling, TPipe *tPipe)
 {
@@ -409,6 +415,8 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
     kRopeGm.SetGlobalBuffer((__gm__ K_ROPE_T *)keyRope);
 
     attentionOutGm.SetGlobalBuffer((__gm__ OUT_T *)attentionOut);
+    softmaxMaxGm.SetGlobalBuffer((__gm__ T *)softmaxMax);
+    softmaxSumGm.SetGlobalBuffer((__gm__ T *)softmaxSum);
 
     if ASCEND_IS_AIV {
         if (constInfo.needInit && LAYOUT_T != SFA_LAYOUT::TND) {

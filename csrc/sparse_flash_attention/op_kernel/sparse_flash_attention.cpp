@@ -25,7 +25,8 @@ using namespace AscendC;
         GET_TILING_DATA_WITH_STRUCT(tilingdataClass, tiling_data_in, tiling);                     \
         const tilingdataClass *__restrict tiling_data = &tiling_data_in;                          \
         op.Init(query, key, value, sparseIndices, actualSeqLengthsQuery, actualSeqLengthsKV,      \
-	    blocktable, queryRope, keyRope, attentionOut, user, tiling_data, tiling, &tPipe);         \
+	    blocktable, queryRope, keyRope, attentionOut, softmaxMax, softmaxSum,                     \
+	    user, tiling_data, tiling, &tPipe);                                                       \
         op.Process();                                                                             \
     } while (0)
 
@@ -35,7 +36,9 @@ sparse_flash_attention(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_
                        __gm__ uint8_t *sparseIndices, __gm__ uint8_t *blocktable,
                        __gm__ uint8_t *actualSeqLengthsQuery, __gm__ uint8_t *actualSeqLengthsKV,
                        __gm__ uint8_t* queryRope, __gm__ uint8_t* keyRope,
-                       __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
+                       __gm__ uint8_t *attentionOut,
+                       __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+                       __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 
