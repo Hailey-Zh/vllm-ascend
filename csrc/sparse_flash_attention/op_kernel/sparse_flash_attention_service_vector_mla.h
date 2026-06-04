@@ -330,11 +330,13 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
                                                              LocalTensor<T> &softmaxSumUbSlice,
                                                              LocalTensor<T> &softmaxMaxUbSlice)
 {
-    // [DEBUG] 暂时无条件无 sync 地写 1 个常量值到 GM offset 0，
-    // 用以区分 "函数没跑" vs "UB->GM 路径有 bug"。
-    // 如果 LSE[0] 是 99，说明函数被触发；如果还是 0，说明根本没进这里。
-    matmul::InitOutput<T>(softmaxMaxGm_[0], 1, (T)99.0f);
-    matmul::InitOutput<T>(softmaxSumGm_[0], 1, (T)77.0f);
+    // [DEBUG] 无条件写 8 个常量到 GM offset 0。
+    // host 侧用 88.0 标记；kernel 这里写 99.0 / 77.0 标记。
+    // - 输出全是 88：host adapter 重编了，kernel 没跑 / 没新版
+    // - 输出含 99：kernel debug stub 跑到了
+    // - 输出全是 0：host adapter 也没重编
+    matmul::InitOutput<T>(softmaxMaxGm_[0], 8, (T)99.0f);
+    matmul::InitOutput<T>(softmaxSumGm_[0], 8, (T)77.0f);
 }
 
 template <typename SFAT>

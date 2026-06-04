@@ -62,6 +62,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
     auto lse_options = query.options().dtype(at::kFloat);
     at::Tensor softmax_max = at::empty(lse_shape, lse_options);
     at::Tensor softmax_sum = at::empty(lse_shape, lse_options);
+    // [DEBUG] host-side sentinel: 88.0 marks host adapter is rebuilt.
+    // kernel debug stub overwrites position 0 with 99.0 if it runs.
+    softmax_max.fill_(88.0f);
+    softmax_sum.fill_(88.0f);
 
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
