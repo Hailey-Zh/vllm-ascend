@@ -264,11 +264,26 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::InitAllZeroOutput(uint32_t
         uint64_t attenOutOffset = (tBase + s1Idx) * kvHeadNum * constInfo.gSize * headDim +
                                     n2Idx * constInfo.gSize * headDim;
         matmul::InitOutput<OUT_T>(attentionOutGm[attenOutOffset], constInfo.gSize * headDim, 0);
+        if (constInfo.returnSoftmaxLse) {
+            // LSE TND layout: [N2, T_total, G]
+            uint64_t softmaxOffset = n2Idx * actualSeqLengthsQGm.GetValue(constInfo.batchSize - 1) * constInfo.gSize +
+                                     (tBase + s1Idx) * constInfo.gSize;
+            matmul::InitOutput<T>(softmaxSumGm[softmaxOffset], constInfo.gSize, 0);
+            matmul::InitOutput<T>(softmaxMaxGm[softmaxOffset], constInfo.gSize, 0);
+        }
     } else if (constInfo.outputLayout == SFA_LAYOUT::BSND) {
         uint64_t attenOutOffset = bIdx * constInfo.qSeqSize * kvHeadNum * constInfo.gSize * headDim +
                                     s1Idx * kvHeadNum * constInfo.gSize * headDim +
                                     n2Idx * constInfo.gSize * headDim;
         matmul::InitOutput<OUT_T>(attentionOutGm[attenOutOffset], constInfo.gSize * headDim, 0);
+        if (constInfo.returnSoftmaxLse) {
+            // LSE BSND layout: [B, N2, S1, G]
+            uint64_t softmaxOffset = bIdx * kvHeadNum * constInfo.qSeqSize * constInfo.gSize +
+                                     n2Idx * constInfo.qSeqSize * constInfo.gSize +
+                                     s1Idx * constInfo.gSize;
+            matmul::InitOutput<T>(softmaxSumGm[softmaxOffset], constInfo.gSize, 0);
+            matmul::InitOutput<T>(softmaxMaxGm[softmaxOffset], constInfo.gSize, 0);
+        }
     }
 }
 
@@ -281,8 +296,21 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::InitOutputSingleCore()
         uint64_t singleCoreSize = (totalOutputSize + (2 * coreNum) - 1) / (2 * coreNum);  // 2 means c:v = 1:2
         uint64_t tailSize = totalOutputSize - tmpBlockIdx * singleCoreSize;
         uint64_t singleInitOutputSize = tailSize < singleCoreSize ? tailSize : singleCoreSize;
-        if (singleInitOutputSize > 0) {
+        if (tmpBlockIdx * singleCoreSize < totalOutputSize && singleInitOutputSize > 0) {
             matmul::InitOutput<OUT_T>(attentionOutGm[tmpBlockIdx * singleCoreSize], singleInitOutputSize, 0);
+        }
+        // LSE 总大小：B * N2 * qSeqSize * G (BSND) 或 N2 * T_total * G (TND)
+        // 两种 layout 总元素数相同：B * N2 * qSeqSize * G == N2 * T_total * G（当 T_total = sum(actS1)，
+        // 但实际 GM 按 InferShape 分配的是 padded shape，所以用 qSeqSize 保险）
+        if (constInfo.returnSoftmaxLse) {
+            uint64_t totalLseSize = constInfo.batchSize * constInfo.kvHeadNum * constInfo.qSeqSize * constInfo.gSize;
+            uint64_t singleCoreLseSize = (totalLseSize + (2 * coreNum) - 1) / (2 * coreNum);
+            uint64_t tailLseSize = totalLseSize - tmpBlockIdx * singleCoreLseSize;
+            uint64_t singleInitLseSize = tailLseSize < singleCoreLseSize ? tailLseSize : singleCoreLseSize;
+            if (tmpBlockIdx * singleCoreLseSize < totalLseSize && singleInitLseSize > 0) {
+                matmul::InitOutput<T>(softmaxSumGm[tmpBlockIdx * singleCoreLseSize], singleInitLseSize, 0);
+                matmul::InitOutput<T>(softmaxMaxGm[tmpBlockIdx * singleCoreLseSize], singleInitLseSize, 0);
+            }
         }
         SyncAll();
     }
