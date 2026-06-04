@@ -330,56 +330,11 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
                                                              LocalTensor<T> &softmaxSumUbSlice,
                                                              LocalTensor<T> &softmaxMaxUbSlice)
 {
-    if (mSplitInfo.vecDealM == 0) {
-        return;
-    }
-    uint64_t baseOffset = mSplitInfo.nBufferStartM / 2;
-    size_t size = mSplitInfo.vecDealM;
-
-    // softmax_max / softmax_sum layout（与 proto.cpp InferShape 对齐）：
-    //   TND : [N2, T_total, G]
-    //   BSND: [B, N2, S1, G]
-    int64_t offset = 0;
-    if constexpr (LAYOUT_T == SFA_LAYOUT::TND) {
-        uint64_t actualSeqQTotal = actualSeqLengthsQGm.GetValue(constInfo.batchSize - 1);
-        uint64_t actualSeqQPrefixSum = (info.bIdx <= 0) ? 0 : actualSeqLengthsQGm.GetValue(info.bIdx - 1);
-        offset += info.n2Idx * actualSeqQTotal * constInfo.gSize +
-                  (actualSeqQPrefixSum + info.gS1Idx / constInfo.gSize) * constInfo.gSize +
-                  mSplitInfo.nBufferStartM + mSplitInfo.vecStartM;
-    } else {
-        offset += info.bIdx * constInfo.kvHeadNum * constInfo.qSeqSize * constInfo.gSize +
-                  info.n2Idx * constInfo.qSeqSize * constInfo.gSize +
-                  info.gS1Idx / constInfo.gSize * constInfo.gSize +
-                  mSplitInfo.nBufferStartM + mSplitInfo.vecStartM;
-    }
-
-    if (info.actualSingleProcessSInnerSize != 0) {
-        DataCopyExtParams dataCopyParams;
-        dataCopyParams.blockCount = 1;
-        dataCopyParams.blockLen = sizeof(T) * size;
-        dataCopyParams.srcStride = 0;
-        dataCopyParams.dstStride = 0;
-        size_t alignedSize = (sizeof(T) * size + 31) / 32 * 32 / sizeof(T);
-
-        LocalTensor<T> tmp = outputBuff2.Get<T>();
-        WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
-        DataCopy(tmp, softmaxMaxUbSlice[baseOffset], alignedSize);
-        SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
-        WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
-        DataCopyPad(softmaxMaxGm_[offset], tmp, dataCopyParams);
-        SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
-
-        tmp = outputBuff2.Get<T>();
-        WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
-        DataCopy(tmp, softmaxSumUbSlice[baseOffset], alignedSize);
-        SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
-        WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
-        DataCopyPad(softmaxSumGm_[offset], tmp, dataCopyParams);
-        SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
-    } else {
-        matmul::InitOutput<T>(softmaxSumGm_[offset], size, ConstInfo::FLOAT_ZERO);
-        matmul::InitOutput<T>(softmaxMaxGm_[offset], size, SOFTMAX_MIN_NUM);
-    }
+    // [DEBUG] 暂时无条件无 sync 地写 1 个常量值到 GM offset 0，
+    // 用以区分 "函数没跑" vs "UB->GM 路径有 bug"。
+    // 如果 LSE[0] 是 99，说明函数被触发；如果还是 0，说明根本没进这里。
+    matmul::InitOutput<T>(softmaxMaxGm_[0], 1, (T)99.0f);
+    matmul::InitOutput<T>(softmaxSumGm_[0], 1, (T)77.0f);
 }
 
 template <typename SFAT>
