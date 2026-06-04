@@ -339,24 +339,46 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
     // 若 sm 对：原 bug 在 softmaxSumUb 读位置错
     matmul::InitOutput<T>(softmaxMaxGm_[0], 8, (T)99.0f);
 
-    // 探测 softmaxMaxUb 实际内容：把 softmaxMaxUbSlice[0..7] 读到 outputBuff2，
-    // DataCopyPad 写到 softmaxSumGm_[0..7]。sm 输出 = softmax UB 内容。
-    // 期望：有意义的负数（softmax max），如 -1.5, -2.1 等
-    // 若全是 0：UB 没被 SoftmaxFlashV2 写入（同步问题或 outIdx 不对）
-    // 若是大数 / NaN / Inf：UB 写了但读的位置不对
-    LocalTensor<T> tmp = outputBuff2.Get<T>();
-    WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
-    DataCopy(tmp, softmaxMaxUbSlice[0], 8);
-    SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
-    WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+    // 恢复原始路径，但保留 mx=99 对照。
+    // 单行 case (B=1,S1=1,actS1=1) 时 offset=0，sm 应该看到 ~[1,2,3,...] 的 softmax max 值。
+    if (mSplitInfo.vecDealM == 0) {
+        return;
+    }
+    uint64_t baseOffset = mSplitInfo.nBufferStartM / 2;
+    size_t size = mSplitInfo.vecDealM;
 
-    DataCopyExtParams dataCopyParams;
-    dataCopyParams.blockCount = 1;
-    dataCopyParams.blockLen = sizeof(T) * 8;
-    dataCopyParams.srcStride = 0;
-    dataCopyParams.dstStride = 0;
-    DataCopyPad(softmaxSumGm_[0], tmp, dataCopyParams);
-    SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+    int64_t offset = 0;
+    if constexpr (LAYOUT_T == SFA_LAYOUT::TND) {
+        uint64_t actualSeqQTotal = actualSeqLengthsQGm.GetValue(constInfo.batchSize - 1);
+        uint64_t actualSeqQPrefixSum = (info.bIdx <= 0) ? 0 : actualSeqLengthsQGm.GetValue(info.bIdx - 1);
+        offset += info.n2Idx * actualSeqQTotal * constInfo.gSize +
+                  (actualSeqQPrefixSum + info.gS1Idx / constInfo.gSize) * constInfo.gSize +
+                  mSplitInfo.nBufferStartM + mSplitInfo.vecStartM;
+    } else {
+        offset += info.bIdx * constInfo.kvHeadNum * constInfo.qSeqSize * constInfo.gSize +
+                  info.n2Idx * constInfo.qSeqSize * constInfo.gSize +
+                  info.gS1Idx / constInfo.gSize * constInfo.gSize +
+                  mSplitInfo.nBufferStartM + mSplitInfo.vecStartM;
+    }
+
+    if (info.actualSingleProcessSInnerSize != 0) {
+        DataCopyExtParams dataCopyParams;
+        dataCopyParams.blockCount = 1;
+        dataCopyParams.blockLen = sizeof(T) * size;
+        dataCopyParams.srcStride = 0;
+        dataCopyParams.dstStride = 0;
+        size_t alignedSize = (sizeof(T) * size + 31) / 32 * 32 / sizeof(T);
+
+        LocalTensor<T> tmp = outputBuff2.Get<T>();
+        WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+        DataCopy(tmp, softmaxSumUbSlice[baseOffset], alignedSize);
+        SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+        WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+        DataCopyPad(softmaxSumGm_[offset], tmp, dataCopyParams);
+        SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+    } else {
+        matmul::InitOutput<T>(softmaxSumGm_[offset], size, ConstInfo::FLOAT_ZERO);
+    }
 }
 
 template <typename SFAT>
