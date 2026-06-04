@@ -330,11 +330,30 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
                                                              LocalTensor<T> &softmaxSumUbSlice,
                                                              LocalTensor<T> &softmaxMaxUbSlice)
 {
-    // [DEBUG] 只写 max，sum 不动。检查两个 GM 是否别名。
-    // - mx=99 sm=88 → max/sum 独立 ✓
-    // - mx=99 sm=99 → softmaxSumGm_ 别名到 softmaxMaxGm_
-    // - mx=88 sm=88 → kernel 没跑到 / softmaxMaxGm_ 别名错位
+    // [DEBUG] 隔离测试 UB→GM 路径：
+    //   1) 在 outputBuff2 写已知序列 [10..80]
+    //   2) DataCopyPad 输出到 softmaxSumGm_[0]
+    //   3) softmaxMaxGm_ 仍用 InitOutput 写常量 99 作对照
+    // 期望 sm = [10,20,30,40,50,60,70,80], mx = [99,...,99]
+    // 若 sm 不对：DataCopyPad/同步本身有问题
+    // 若 sm 对：原 bug 在 softmaxSumUb 读位置错
     matmul::InitOutput<T>(softmaxMaxGm_[0], 8, (T)99.0f);
+
+    LocalTensor<T> tmp = outputBuff2.Get<T>();
+    WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+    for (uint32_t i = 0; i < 8; i++) {
+        tmp.SetValue(i, (T)((i + 1) * 10));  // 10, 20, ..., 80
+    }
+    SetFlag<AscendC::HardEvent::S_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+    WaitFlag<AscendC::HardEvent::S_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+
+    DataCopyExtParams dataCopyParams;
+    dataCopyParams.blockCount = 1;
+    dataCopyParams.blockLen = sizeof(T) * 8;
+    dataCopyParams.srcStride = 0;
+    dataCopyParams.dstStride = 0;
+    DataCopyPad(softmaxSumGm_[0], tmp, dataCopyParams);
+    SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
 }
 
 template <typename SFAT>
