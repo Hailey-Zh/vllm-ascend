@@ -330,13 +330,11 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
                                                              LocalTensor<T> &softmaxSumUbSlice,
                                                              LocalTensor<T> &softmaxMaxUbSlice)
 {
-    // [DEBUG] 无条件写 8 个常量到 GM offset 0。
-    // host 侧用 88.0 标记；kernel 这里写 99.0 / 77.0 标记。
-    // - 输出全是 88：host adapter 重编了，kernel 没跑 / 没新版
-    // - 输出含 99：kernel debug stub 跑到了
-    // - 输出全是 0：host adapter 也没重编
+    // [DEBUG] 只写 max，sum 不动。检查两个 GM 是否别名。
+    // - mx=99 sm=88 → max/sum 独立 ✓
+    // - mx=99 sm=99 → softmaxSumGm_ 别名到 softmaxMaxGm_
+    // - mx=88 sm=88 → kernel 没跑到 / softmaxMaxGm_ 别名错位
     matmul::InitOutput<T>(softmaxMaxGm_[0], 8, (T)99.0f);
-    matmul::InitOutput<T>(softmaxSumGm_[0], 8, (T)77.0f);
 }
 
 template <typename SFAT>
