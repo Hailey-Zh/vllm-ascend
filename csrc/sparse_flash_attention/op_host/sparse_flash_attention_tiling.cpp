@@ -339,6 +339,7 @@ void SFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_sparseMode(sfaInfo_->sparseMode);
     tilingData_.baseParams.set_sparseBlockSize(sfaInfo_->sparseBlockSize);
     tilingData_.baseParams.set_sparseBlockCount(sfaInfo_->sparseBlockCount);
+    tilingData_.baseParams.set_returnSoftmaxLse(sfaInfo_->returnSoftmaxLse ? 1U : 0U);
 }
 
 // for flash decode
@@ -1497,6 +1498,7 @@ ge::graphStatus SFAInfoParser::GetAttrParaInfo()
     opParamInfo_.sparseBlockSize = attrs->GetAttrPointer<int64_t>(SPARSE_BLOCK_SIZE_ATTR_INDEX);
     opParamInfo_.scaleValue = attrs->GetAttrPointer<float>(SCALE_VALUE_ATTR_INDEX);
     opParamInfo_.sparseMode = attrs->GetAttrPointer<int64_t>(SPARSE_MODE_ATTR_INDEX);
+    opParamInfo_.returnSoftmaxLse = attrs->GetAttrPointer<bool>(RETURN_SOFTMAX_LSE_ATTR_INDEX);
 
     return ge::GRAPH_SUCCESS;
 }
@@ -1785,6 +1787,7 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
     sfaInfo.isSameActualseq = isSameActualseq_;
 
     sfaInfo.sparseMode = *opParamInfo_.sparseMode;
+    sfaInfo.returnSoftmaxLse = (opParamInfo_.returnSoftmaxLse != nullptr) && *opParamInfo_.returnSoftmaxLse;
 
     sfaInfo.qLayout = qLayout_;
     sfaInfo.topkLayout = topkLayout_;

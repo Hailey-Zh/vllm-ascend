@@ -41,6 +41,7 @@ constexpr uint32_t SPARSE_BLOCK_SIZE_ATTR_INDEX = 1;
 constexpr uint32_t LAYOUT_QUERY_ATTR_INDEX = 2;
 constexpr uint32_t LAYOUT_KV_ATTR_INDEX = 3;
 constexpr uint32_t SPARSE_MODE_ATTR_INDEX = 4;
+constexpr uint32_t RETURN_SOFTMAX_LSE_ATTR_INDEX = 5;
 // Dim Num
 constexpr size_t DIM_NUM_TWO = 2;
 constexpr size_t DIM_NUM_THREE = 3;
@@ -119,6 +120,7 @@ struct SFAParaInfo {
     const int64_t *sparseBlockSize = nullptr;
     const float *scaleValue = nullptr;
     const int64_t *sparseMode = nullptr;
+    const bool *returnSoftmaxLse = nullptr;
 };
 
 struct InnerSplitParams {
@@ -140,6 +142,7 @@ TILING_DATA_FIELD_DEF(uint32_t, outputLayout)
 TILING_DATA_FIELD_DEF(uint32_t, sparseMode)
 TILING_DATA_FIELD_DEF(int64_t, sparseBlockSize)
 TILING_DATA_FIELD_DEF(uint32_t, sparseBlockCount)
+TILING_DATA_FIELD_DEF(uint32_t, returnSoftmaxLse)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(SparseFlashAttentionBaseParamsMlaOp, SparseFlashAttentionBaseParamsMla)
 
@@ -242,6 +245,7 @@ struct SFATilingInfo {
     std::vector<int64_t> kvListSeqLens {};
 
     uint32_t sparseMode = 0;
+    bool returnSoftmaxLse = false;
 
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKvType = ge::DT_FLOAT16;

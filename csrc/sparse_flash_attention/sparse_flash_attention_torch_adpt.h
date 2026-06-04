@@ -17,7 +17,7 @@
 #define SPARSE_FLASH_ATTENTION_TORCH_ADPT_H
 namespace vllm_ascend {
 
-at::Tensor npu_sparse_flash_attention(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices, double scale_value, int64_t sparse_block_size,
     const c10::optional<at::Tensor> &block_table,
@@ -26,7 +26,8 @@ at::Tensor npu_sparse_flash_attention(
     const c10::optional<at::Tensor> &query_rope,
     const c10::optional<at::Tensor> &key_rope, c10::string_view layout_query,
     c10::string_view layout_kv,
-    int64_t sparse_mode)
+    int64_t sparse_mode,
+    bool return_softmax_lse)
 {
     std::string layout_query_str = std::string(layout_query);
     std::string layout_kv_str = std::string(layout_kv);
@@ -35,9 +36,36 @@ at::Tensor npu_sparse_flash_attention(
         TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
                                        "than 0, but shape[", i, "] is ", query.size(i));
     }
-    // construct the output tensor
+
+    // attention_out: 与 query 同 shape / dtype
     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
-    // convert str
+
+    // softmax_max / softmax_sum：return_softmax_lse=false 时输出空 tensor [0]
+    //                            =true  时按 layout 推 shape
+    //   - TND : [N2, T1, G]
+    //   - BSND: [B, N2, S1, G]
+    // N2 在 key 的位置：PA_BSND/BSND = dim 2，TND = dim 1
+    std::vector<int64_t> lse_shape;
+    if (return_softmax_lse) {
+        int64_t n2 = (layout_kv_str == "TND") ? key.size(1) : key.size(2);
+        TORCH_CHECK(n2 > 0, "key's N2 dim must be > 0, got ", n2);
+        if (layout_query_str == "TND") {
+            int64_t t1 = query.size(0);
+            int64_t n1 = query.size(1);
+            lse_shape = {n2, t1, n1 / n2};
+        } else {  // BSND
+            int64_t b = query.size(0);
+            int64_t s1 = query.size(1);
+            int64_t n1 = query.size(2);
+            lse_shape = {b, n2, s1, n1 / n2};
+        }
+    } else {
+        lse_shape = {0};
+    }
+    auto lse_options = query.options().dtype(at::kFloat);
+    at::Tensor softmax_max = at::empty(lse_shape, lse_options);
+    at::Tensor softmax_sum = at::empty(lse_shape, lse_options);
+
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
 
@@ -57,8 +85,11 @@ at::Tensor npu_sparse_flash_attention(
         layout_query_ptr,
         layout_kv_ptr,
         sparse_mode,
-        output);
-    return output;
-}    
+        return_softmax_lse,
+        output,
+        softmax_max,
+        softmax_sum);
+    return std::make_tuple(output, softmax_max, softmax_sum);
+}
 }
 #endif

@@ -230,7 +230,7 @@ at::Tensor npu_lightning_indexer_meta(
     return lightning_indexer_output;
 }
 
-at::Tensor npu_sparse_flash_attention_meta(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices, double scale_value, int64_t sparse_block_size,
     const c10::optional<at::Tensor> &block_table,
@@ -239,15 +239,32 @@ at::Tensor npu_sparse_flash_attention_meta(
     const c10::optional<at::Tensor> &query_rope,
     const c10::optional<at::Tensor> &key_rope, c10::string_view layout_query,
     c10::string_view layout_kv,
-    int64_t sparse_mode)
+    int64_t sparse_mode,
+    bool return_softmax_lse)
 {
     std::string layout_query_str = std::string(layout_query);
+    std::string layout_kv_str = std::string(layout_kv);
     for (size_t i = 0; i < query.sizes().size(); i++) {
         TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
                                        "than 0, but shape[", i, "] is ", query.size(i));
     }
     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
-    return output;
+
+    std::vector<int64_t> lse_shape;
+    if (return_softmax_lse) {
+        int64_t n2 = (layout_kv_str == "TND") ? key.size(1) : key.size(2);
+        if (layout_query_str == "TND") {
+            lse_shape = {n2, query.size(0), query.size(1) / n2};
+        } else {
+            lse_shape = {query.size(0), n2, query.size(1), query.size(2) / n2};
+        }
+    } else {
+        lse_shape = {0};
+    }
+    auto lse_options = query.options().dtype(at::kFloat);
+    at::Tensor softmax_max = at::empty(lse_shape, lse_options);
+    at::Tensor softmax_sum = at::empty(lse_shape, lse_options);
+    return std::make_tuple(output, softmax_max, softmax_sum);
 }
 std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(
     const at::Tensor &x1,

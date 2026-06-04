@@ -45,6 +45,7 @@ def call_npu_eager(torch_tensor_dict, params):
         layout_query=params.get("layout_query"),
         layout_kv=params.get("layout_kv"),
         sparse_mode=params.get("sparsemode", 3),
+        return_softmax_lse=params.get("return_softmax_lse", False),
     )
 
 
