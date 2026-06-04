@@ -40,13 +40,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
     // attention_out: 与 query 同 shape / dtype
     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
 
-    // softmax_max / softmax_sum：return_softmax_lse=false 时输出空 tensor [0]
-    //                            =true  时按 layout 推 shape
+    // softmax_max / softmax_sum：始终按 layout 推真实 shape（避免 [0] 空 tensor 让 aclnn dispatch 崩）
     //   - TND : [N2, T1, G]
     //   - BSND: [B, N2, S1, G]
     // N2 在 key 的位置：PA_BSND/BSND = dim 2，TND = dim 1
     std::vector<int64_t> lse_shape;
-    if (return_softmax_lse) {
+    {
         int64_t n2 = (layout_kv_str == "TND") ? key.size(1) : key.size(2);
         TORCH_CHECK(n2 > 0, "key's N2 dim must be > 0, got ", n2);
         if (layout_query_str == "TND") {
@@ -59,8 +58,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
             int64_t n1 = query.size(2);
             lse_shape = {b, n2, s1, n1 / n2};
         }
-    } else {
-        lse_shape = {0};
     }
     auto lse_options = query.options().dtype(at::kFloat);
     at::Tensor softmax_max = at::empty(lse_shape, lse_options);

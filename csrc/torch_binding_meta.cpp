@@ -251,15 +251,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
 
     std::vector<int64_t> lse_shape;
-    if (return_softmax_lse) {
+    {
         int64_t n2 = (layout_kv_str == "TND") ? key.size(1) : key.size(2);
         if (layout_query_str == "TND") {
             lse_shape = {n2, query.size(0), query.size(1) / n2};
         } else {
             lse_shape = {query.size(0), n2, query.size(1), query.size(2) / n2};
         }
-    } else {
-        lse_shape = {0};
     }
     auto lse_options = query.options().dtype(at::kFloat);
     at::Tensor softmax_max = at::empty(lse_shape, lse_options);
