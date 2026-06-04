@@ -341,9 +341,14 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyFALseToGm(const RunInfo &info
 
     LocalTensor<T> tmp = outputBuff2.Get<T>();
     WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
-    for (uint32_t i = 0; i < 8; i++) {
-        tmp.SetValue(i, static_cast<T>(static_cast<float>(i + 1) * 10.0f));  // 10, 20, ..., 80
-    }
+    tmp.SetValue(0, static_cast<T>(10.0f));
+    tmp.SetValue(1, static_cast<T>(20.0f));
+    tmp.SetValue(2, static_cast<T>(30.0f));
+    tmp.SetValue(3, static_cast<T>(40.0f));
+    tmp.SetValue(4, static_cast<T>(50.0f));
+    tmp.SetValue(5, static_cast<T>(60.0f));
+    tmp.SetValue(6, static_cast<T>(70.0f));
+    tmp.SetValue(7, static_cast<T>(80.0f));
     SetFlag<AscendC::HardEvent::S_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
     WaitFlag<AscendC::HardEvent::S_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
 
