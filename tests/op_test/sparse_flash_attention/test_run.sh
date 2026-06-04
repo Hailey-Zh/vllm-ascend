@@ -191,18 +191,23 @@ PARAMSET_FILE=""
 
 parse_options "$@"
 
+rc=0
 case "$mode" in
     single)
         run_single "$PT_PATH"
+        rc=$?
         ;;
     batch_save)
         run_batch_save "$EXCEL_PATH" "$EXCEL_SHEET" "$PT_PATH"
+        rc=$?
         ;;
     gen_excel_from_paramset)
         run_gen_excel_from_paramset "$PARAMSET_FILE" "$EXCEL_PATH" "$EXCEL_SHEET"
+        rc=$?
         ;;
     batch_exec)
         run_batch_exec "$PT_PATH"
+        rc=$?
         ;;
     help)
         show_help
@@ -213,4 +218,4 @@ case "$mode" in
         ;;
 esac
 
-exit 0
+exit $rc
