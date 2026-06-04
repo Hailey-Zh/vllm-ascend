@@ -152,6 +152,7 @@ struct ConstInfo {
     SFA_LAYOUT outputLayout;
     uint32_t sparseMode = 0;
     bool needInit = false;
+    bool returnSoftmaxLse = false;
 
     // FlashDecoding
     uint32_t actualCombineLoopSize = 0U;
