@@ -240,18 +240,21 @@ void SFAMlaTiling::GenTilingKey()
     uint32_t outputType = static_cast<uint32_t>(sfaInfo_->outputType);
     uint32_t layoutQuery = static_cast<uint32_t>(sfaInfo_->qLayout);
     uint32_t layoutKV = static_cast<uint32_t>(sfaInfo_->kvLayout);
-    // 与 SFATilingCheck 一致：dense 信号从 sparseIndices tensor 直接判，不依赖 sfaInfo_->isDenseMode 字段。
-    // 兜底防御：若 isDenseMode 字段传播异常，tiling key 仍能拿到正确的 IS_DENSE bit。
+    // [bug 修复] 用中间变量赋值得到 Shape，避免 StorageShape::GetDimNum 语义差异。
     const auto *si = sfaInfo_->opParamInfo.sparseIndices.tensor;
-    bool dense = sfaInfo_->isDenseMode ||
-                 (si == nullptr) ||
-                 (si != nullptr && si->GetStorageShape().GetDimNum() == 1U);
+    bool dense = sfaInfo_->isDenseMode || (si == nullptr);
+    if (!dense && si != nullptr) {
+        gert::Shape shape;
+        shape = si->GetStorageShape();
+        dense = (shape.GetDimNum() == 1U);
+    }
     uint32_t isDense = dense ? 1U : 0U;
 
     tilingKey_ = GET_TPL_TILING_KEY(0U, layoutQuery, layoutKV,
                                     perfMode_ == SFAPerfMode::V_TEMPLATE_MODE, isDense);
 
-    OPS_LOG_I(sfaInfo_->opName, "SFA tilingKey_: %lu, isDense=%u.", tilingKey_, isDense);
+    OPS_LOG_E(sfaInfo_->opName, "[DIAG] GenTilingKey: tilingKey_=%lu, isDense=%u, si=%p",
+              tilingKey_, isDense, si);
 }
 
 void SFAMlaTiling::ZeroTensorProcess()
@@ -268,12 +271,15 @@ void SFAMlaTiling::InitParams()
     } else {
         perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
     }
-    // step 3b/3c: dense 模式只走 C_TEMPLATE（V_TEMPLATE 的 KV merge 路径不适用稠密）。
-    // 同 GenTilingKey 的防御：从 tensor 形态直接判，不依赖 sfaInfo_->isDenseMode 字段。
+    // step 3b/3c: dense 模式只走 C_TEMPLATE。
+    // [bug 修复] 用中间变量赋值得到 Shape，避免 StorageShape::GetDimNum 语义差异。
     const auto *si = sfaInfo_->opParamInfo.sparseIndices.tensor;
-    bool dense = sfaInfo_->isDenseMode ||
-                 (si == nullptr) ||
-                 (si != nullptr && si->GetStorageShape().GetDimNum() == 1U);
+    bool dense = sfaInfo_->isDenseMode || (si == nullptr);
+    if (!dense && si != nullptr) {
+        gert::Shape shape;
+        shape = si->GetStorageShape();
+        dense = (shape.GetDimNum() == 1U);
+    }
     if (dense) {
         perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
     }
@@ -354,21 +360,23 @@ void SFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_actualLenDimsKV(sfaInfo_->actualLenDimsKV);
     tilingData_.baseParams.set_outputLayout(static_cast<uint32_t>(sfaInfo_->outLayout));
     tilingData_.baseParams.set_sparseMode(sfaInfo_->sparseMode);
-    // [bug fix] 防御性地在 fill tiling data 之前再次计算 dense 状态，避免依赖
-    // sfaInfo_->sparseBlockSize/Count 字段（万一 GenerateInfo 的 dense override 因
-    // isDenseMode 字段读写异常没生效，这里能兜底）。
+    // [bug 修复] 防御性地在 fill tiling data 之前再次计算 dense 状态。
+    //          通过中间变量赋值得到 Shape，避免 StorageShape::GetDimNum 语义差异。
     const auto *si = sfaInfo_->opParamInfo.sparseIndices.tensor;
-    bool dense = sfaInfo_->isDenseMode ||
-                 (si == nullptr) ||
-                 (si != nullptr && si->GetStorageShape().GetDimNum() == 1U);
+    bool dense = sfaInfo_->isDenseMode || (si == nullptr);
+    if (!dense && si != nullptr) {
+        gert::Shape shape;
+        shape = si->GetStorageShape();
+        dense = (shape.GetDimNum() == 1U);
+    }
     int64_t effectiveSparseBlockSize = dense ? 1 : sfaInfo_->sparseBlockSize;
     int64_t effectiveSparseBlockCount =
         dense ? static_cast<int64_t>(sfaInfo_->s2Size) : sfaInfo_->sparseBlockCount;
     tilingData_.baseParams.set_sparseBlockSize(effectiveSparseBlockSize);
     tilingData_.baseParams.set_sparseBlockCount(effectiveSparseBlockCount);
     tilingData_.baseParams.set_returnSoftmaxLse(sfaInfo_->returnSoftmaxLse ? 1U : 0U);
-    OPS_LOG_I(sfaInfo_->opName,
-              "SFA FillTiling: dense=%d, effectiveSparseBlockSize=%ld, effectiveSparseBlockCount=%ld, s2Size=%ld",
+    OPS_LOG_E(sfaInfo_->opName,
+              "[DIAG] FillTiling: dense=%d, effSparseBlockSize=%ld, effSparseBlockCount=%ld, s2Size=%ld",
               dense, effectiveSparseBlockSize, effectiveSparseBlockCount,
               static_cast<int64_t>(sfaInfo_->s2Size));
 }
@@ -742,10 +750,19 @@ ge::graphStatus SFATilingCheck::CheckSinglePara() const
         return ge::GRAPH_FAILED;
     }
     // dense 模式（tensor == nullptr 或 rank == 1 的 dummy）下跳过 sparse_indices dtype 检查。
-    // 直接看 opParamInfo_（Init() 刚刚复制过来，肯定是最新的），不读 sfaInfo_.isDenseMode 字段，
-    // 防止任何 SFATilingInfo 字段传播/ABI 异常导致漏判。
+    // [bug 修复] 通过中间变量赋值得到 gert::Shape，与 SetSFAShapeCompare 中
+    //          `topkShapeCmp_ = tensor->GetStorageShape()` 走完全一致的隐式转换路径。
+    //          直接 `tensor->GetStorageShape().GetDimNum()` 可能命中 StorageShape 自己的 GetDimNum
+    //          （而不是 Shape::GetDimNum，CANN gert::StorageShape 包了 origin+storage 两个 Shape）。
     const auto *si = opParamInfo_.sparseIndices.tensor;
-    bool dense = (si == nullptr) || (si->GetStorageShape().GetDimNum() == 1U);
+    bool dense = (si == nullptr);
+    if (!dense && si != nullptr) {
+        gert::Shape shape;
+        shape = si->GetStorageShape();
+        dense = (shape.GetDimNum() == 1U);
+    }
+    OPS_LOG_E(opName_,
+              "[DIAG] CheckSinglePara: si=%p, dense=%d", si, dense);
     if (!dense && ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices()) {
         return ge::GRAPH_FAILED;
     }
@@ -992,10 +1009,20 @@ ge::graphStatus SFATilingCheck::CheckQRope()
 
 ge::graphStatus SFATilingCheck::CheckTopK()
 {
-    // dense 模式跳过 topk shape check。直接看 tensor 形态，不依赖 sfaInfo_.isDenseMode。
-    // 见 CheckSinglePara 注释。
+    // dense 模式跳过 topk shape check。
+    // [bug 修复] 用中间变量赋值得到 Shape，避免 StorageShape::GetDimNum 与 Shape::GetDimNum
+    //          语义可能不同。见 CheckSinglePara 详细注释。
     const auto *si = opParamInfo_.sparseIndices.tensor;
-    bool dense = (si == nullptr) || (si->GetStorageShape().GetDimNum() == 1U);
+    bool dense = (si == nullptr);
+    size_t actualRank = 0;
+    if (!dense && si != nullptr) {
+        gert::Shape shape;
+        shape = si->GetStorageShape();
+        actualRank = shape.GetDimNum();
+        dense = (actualRank == 1U);
+    }
+    OPS_LOG_E(opName_,
+              "[DIAG] CheckTopK: si=%p, actualRank=%zu, dense=%d", si, actualRank, dense);
     if (dense) {
         return ge::GRAPH_SUCCESS;
     }
@@ -1841,19 +1868,23 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
     sfaInfo.sparseMode = *opParamInfo_.sparseMode;
     sfaInfo.returnSoftmaxLse = (opParamInfo_.returnSoftmaxLse != nullptr) && *opParamInfo_.returnSoftmaxLse;
     // [step 3c workaround] dense signal:
-    //   1. tensor == nullptr — the original 3a contract (kept for graph-mode callers that don't go through torch_adpt.h)
-    //   2. tensor rank == 1  — the dummy 1-element tensor that torch_adpt.h substitutes for None
-    //      (real sparse_indices is rank 3 for TND or rank 4 for BSND — never rank 1, no ambiguity)
+    //   1. tensor == nullptr — the original 3a contract (graph-mode callers)
+    //   2. tensor rank == 1  — the dummy from torch_adpt.h (real sparse is rank 3/4)
+    // [bug 修复] 用中间变量赋值得到 Shape，避免 StorageShape::GetDimNum 语义差异。
     bool denseFromNull = (opParamInfo_.sparseIndices.tensor == nullptr);
     bool denseFromDummy = false;
+    size_t debugRank = 0;
     if (opParamInfo_.sparseIndices.tensor != nullptr) {
-        denseFromDummy = (opParamInfo_.sparseIndices.tensor->GetStorageShape().GetDimNum() == 1U);
+        gert::Shape shape;
+        shape = opParamInfo_.sparseIndices.tensor->GetStorageShape();
+        debugRank = shape.GetDimNum();
+        denseFromDummy = (debugRank == 1U);
     }
     bool dense = denseFromNull || denseFromDummy;
     sfaInfo.isDenseMode = dense;
-    OPS_LOG_I(opName_,
-              "SFA isDenseMode: tensor=%p, denseFromNull=%d, denseFromDummy=%d, final=%d",
-              opParamInfo_.sparseIndices.tensor, denseFromNull, denseFromDummy, dense);
+    OPS_LOG_E(opName_,
+              "[DIAG] GenerateInfo: tensor=%p, debugRank=%zu, denseFromNull=%d, denseFromDummy=%d, final=%d",
+              opParamInfo_.sparseIndices.tensor, debugRank, denseFromNull, denseFromDummy, dense);
     // step 3b: dense 模式下覆盖 sparseBlockSize/Count，使 sparseBlockCount * sparseBlockSize >= s2Size
     //          ——这样现有 kernel 公式 min(sparseBlockCount*sparseBlockSize, threshold) 会退化成 threshold，
     //          配合 3c 的 if constexpr (SFAT::isDense) 分支后即为正确的稠密 FA。
