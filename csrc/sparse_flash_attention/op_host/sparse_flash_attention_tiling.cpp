@@ -1867,15 +1867,6 @@ ge::graphStatus SFAInfoParser::Parse(SFATilingInfo &sfaInfo)
     }
 
     GenerateInfo(sfaInfo);
-
-    // [step 3a temporary guard] dense mode (sparse_indices == None) 还没接 kernel，
-    // 会在 step 3b/3c 落地。此拦截会在 3b 第一件事删除。
-    if (sfaInfo.isDenseMode) {
-        OPS_LOG_E(opName_,
-            "sparse_indices is None (dense mode) is not yet supported; "
-            "will be enabled in step 3b/3c. Please pass sparse_indices for now.");
-        return ge::GRAPH_FAILED;
-    }
     return ge::GRAPH_SUCCESS;
 }
 

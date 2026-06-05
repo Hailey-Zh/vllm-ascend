@@ -934,7 +934,32 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::CalcSinnerTopKBegin(RunInf
     if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
         return;
     }
-    
+
+    if constexpr (SFAT::isDense) {
+        // step 3c: dense 路径——curTopKIdx 重定义为"当前 inner-loop 已处理 token 数"，
+        // 不读 topKGm。配合 sparseBlockSize=1 / sparseBlockCount=s2Size (3b fallback)，
+        // 与 sparse 路径在 offset 公式上等价。
+        uint64_t startPos = curTopKIdx;
+        uint64_t remaining = (info.threshold > startPos) ? (info.threshold - startPos) : 0;
+        uint32_t sparseLen = (remaining > constInfo.s2BaseSize) ?
+                             static_cast<uint32_t>(constInfo.s2BaseSize) : static_cast<uint32_t>(remaining);
+        info.actualSingleProcessSInnerSize = sparseLen;
+        info.actualSingleProcessSInnerSizeAlign = SFAAlign(sparseLen,
+            (uint32_t)SFAVectorService<SFAT>::BYTE_BLOCK);
+        tempLoopInfo.s2BasicSizeTail = (sparseLen == constInfo.s2BaseSize) ? 0 : sparseLen;
+        if (sparseLen == 0) {
+            if (curTopKIdx == 0) {
+                DealActSeqLenIsZero(info.bIdx, info.gS1Idx / constInfo.gSize, tempLoopInfo.n2Idx);
+            }
+            return;
+        }
+        info.curTopKIdx = curTopKIdx;
+        info.curOffsetInSparseBlock = 0;
+        curTopKIdx = static_cast<uint32_t>(startPos + sparseLen);
+        curOffsetInSparseBlock = 0;
+        return;
+    }
+
     uint64_t thresholdSparseCount = (info.threshold + constInfo.sparseBlockSize - 1) / constInfo.sparseBlockSize;
     uint64_t validCount = (constInfo.sparseBlockCount > thresholdSparseCount) ? thresholdSparseCount : constInfo.sparseBlockCount;
 

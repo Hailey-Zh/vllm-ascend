@@ -510,6 +510,19 @@ template <typename SFAT>
 __aicore__ inline void SFAMatmulService<SFAT>::CalcTopKBlockInfo(
     const RunInfo &info, uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock, uint32_t curSeqIdx, uint32_t &copyRowCnt, int64_t &idInTopK)
 {
+    if constexpr (SFAT::isDense) {
+        // step 3c: dense 路径——idInTopK 跟踪当前 batch 内绝对 s2 token 位置；
+        // curOffsetInSparseBlock 恒为 0（sparseBlockSize=1）；不读 topKGm。
+        if (copyRowCnt > 0) {
+            idInTopK += copyRowCnt;  // 上一轮拷贝了 copyRowCnt 行，前进
+        }
+        uint64_t remaining = (info.threshold > static_cast<uint64_t>(idInTopK)) ?
+                             (info.threshold - static_cast<uint64_t>(idInTopK)) : 0;
+        copyRowCnt = static_cast<uint32_t>(remaining);
+        curOffsetInSparseBlock = 0;
+        return;
+    }
+
     uint64_t blockBegin = idInTopK * constInfo.sparseBlockSize;
     uint64_t blockEnd = (blockBegin + constInfo.sparseBlockSize > info.threshold) ?
                         info.threshold : blockBegin + constInfo.sparseBlockSize;
@@ -568,7 +581,13 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
     uint32_t curTopKIdx = info.curTopKIdx;
     uint64_t curOffsetInSparseBlock = info.curOffsetInSparseBlock;
     uint32_t copyRowCnt = 0;
-    int64_t idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
+    // step 3c: dense 模式下 curTopKIdx 即 s2 起始 token 位置；sparse 模式从 topKGm 加载
+    int64_t idInTopK;
+    if constexpr (SFAT::isDense) {
+        idInTopK = static_cast<int64_t>(curTopKIdx);
+    } else {
+        idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
+    }
 
     uint32_t curTopKIdxTmp = 0;
     uint64_t curOffsetInSparseBlockTmp = 0;
@@ -848,7 +867,13 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
         uint32_t curTopKIdx = info.curTopKIdx;
         uint64_t curOffsetInSparseBlock = info.curOffsetInSparseBlock;
         uint32_t copyRowCnt = 0;
-        int64_t idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
+        // step 3c: dense 模式同 ComputeMm1，curTopKIdx 即 s2 起始 token 位置
+        int64_t idInTopK;
+        if constexpr (SFAT::isDense) {
+            idInTopK = static_cast<int64_t>(curTopKIdx);
+        } else {
+            idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
+        }
 
         for (uint32_t k1 = 0; k1 < kL1Loops; k1++) {
             if (k1 == (kL1Loops - 1)) {
