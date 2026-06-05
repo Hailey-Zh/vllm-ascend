@@ -240,8 +240,11 @@ void SFAMlaTiling::GenTilingKey()
     uint32_t outputType = static_cast<uint32_t>(sfaInfo_->outputType);
     uint32_t layoutQuery = static_cast<uint32_t>(sfaInfo_->qLayout);
     uint32_t layoutKV = static_cast<uint32_t>(sfaInfo_->kvLayout);
+    // step 3b: dense 维度独立编码进 tiling key；与 IS_DENSE 模板参数对齐
+    uint32_t isDense = sfaInfo_->isDenseMode ? 1U : 0U;
 
-    tilingKey_ = GET_TPL_TILING_KEY(0U, layoutQuery, layoutKV, perfMode_ == SFAPerfMode::V_TEMPLATE_MODE);
+    tilingKey_ = GET_TPL_TILING_KEY(0U, layoutQuery, layoutKV,
+                                    perfMode_ == SFAPerfMode::V_TEMPLATE_MODE, isDense);
 
     OPS_LOG_I(sfaInfo_->opName, "SFA tilingKey_: %lu.", tilingKey_);
 }
@@ -260,7 +263,11 @@ void SFAMlaTiling::InitParams()
     } else {
         perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
     }
-   
+    // step 3b: dense 模式只走 C_TEMPLATE（V_TEMPLATE 的 KV merge 路径不适用稠密）
+    if (sfaInfo_->isDenseMode) {
+        perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
+    }
+
     coreNum_ = aicNum_;
 
     headDimAlign_ = Align(sfaInfo_->qkHeadDim, BYTE_BLOCK);
@@ -1802,6 +1809,13 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
     sfaInfo.sparseMode = *opParamInfo_.sparseMode;
     sfaInfo.returnSoftmaxLse = (opParamInfo_.returnSoftmaxLse != nullptr) && *opParamInfo_.returnSoftmaxLse;
     sfaInfo.isDenseMode = (opParamInfo_.sparseIndices.tensor == nullptr);
+    // step 3b: dense 模式下覆盖 sparseBlockSize/Count，使 sparseBlockCount * sparseBlockSize >= s2Size
+    //          ——这样现有 kernel 公式 min(sparseBlockCount*sparseBlockSize, threshold) 会退化成 threshold，
+    //          配合 3c 的 if constexpr (SFAT::isDense) 分支后即为正确的稠密 FA。
+    if (sfaInfo.isDenseMode) {
+        sfaInfo.sparseBlockSize = 1;
+        sfaInfo.sparseBlockCount = static_cast<int64_t>(s2Size_);
+    }
 
     sfaInfo.qLayout = qLayout_;
     sfaInfo.topkLayout = topkLayout_;
