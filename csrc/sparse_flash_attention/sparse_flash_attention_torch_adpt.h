@@ -68,12 +68,29 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
 
+    // [step 3c workaround]
+    // Even though sparse_indices is registered as OPTIONAL (def.cpp / proto.h / ops-info.json
+    // all consistent), CANN's auto-generated aclnnSparseFlashAttention wrapper rejects a null
+    // sparseIndicesOptional via NnopbaseAddInput; block_table=None goes through fine despite
+    // identical metadata. To unblock dense mode, we always hand aclnn a non-null tensor:
+    //   - if user passed a real sparse_indices, use it.
+    //   - if user passed None (dense mode), substitute a 1-element int32 dummy on NPU.
+    // The tiling-side detects dense by tensor rank (real sparse is rank 3 or 4), so the dummy
+    // routes correctly to the IS_DENSE=1 template instance.
+    at::Tensor sparse_indices_passthrough;
+    if (sparse_indices.has_value()) {
+        sparse_indices_passthrough = sparse_indices.value();
+    } else {
+        sparse_indices_passthrough = at::zeros(
+            {1}, query.options().dtype(at::kInt));
+    }
+
     EXEC_NPU_CMD(
         aclnnSparseFlashAttention,
         query,
         key,
         value,
-        sparse_indices,
+        sparse_indices_passthrough,
         block_table,
         actual_seq_lengths_query,
         actual_seq_lengths_kv,

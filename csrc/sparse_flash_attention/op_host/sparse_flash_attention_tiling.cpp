@@ -1808,7 +1808,14 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
 
     sfaInfo.sparseMode = *opParamInfo_.sparseMode;
     sfaInfo.returnSoftmaxLse = (opParamInfo_.returnSoftmaxLse != nullptr) && *opParamInfo_.returnSoftmaxLse;
-    sfaInfo.isDenseMode = (opParamInfo_.sparseIndices.tensor == nullptr);
+    // [step 3c workaround] dense signal:
+    //   1. tensor == nullptr — the original 3a contract (kept for graph-mode callers that don't go through torch_adpt.h)
+    //   2. tensor rank == 1  — the dummy 1-element tensor that torch_adpt.h substitutes for None
+    //      (real sparse_indices is rank 3 for TND or rank 4 for BSND — never rank 1, no ambiguity)
+    bool denseFromNull = (opParamInfo_.sparseIndices.tensor == nullptr);
+    bool denseFromDummy = (opParamInfo_.sparseIndices.tensor != nullptr &&
+                           opParamInfo_.sparseIndices.tensor->GetStorageShape().GetDimNum() == 1U);
+    sfaInfo.isDenseMode = denseFromNull || denseFromDummy;
     // step 3b: dense 模式下覆盖 sparseBlockSize/Count，使 sparseBlockCount * sparseBlockSize >= s2Size
     //          ——这样现有 kernel 公式 min(sparseBlockCount*sparseBlockSize, threshold) 会退化成 threshold，
     //          配合 3c 的 if constexpr (SFAT::isDense) 分支后即为正确的稠密 FA。
