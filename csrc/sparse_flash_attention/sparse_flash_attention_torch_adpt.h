@@ -68,21 +68,52 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
 
-    // [step 3c workaround]
-    // Even though sparse_indices is registered as OPTIONAL (def.cpp / proto.h / ops-info.json
-    // all consistent), CANN's auto-generated aclnnSparseFlashAttention wrapper rejects a null
-    // sparseIndicesOptional via NnopbaseAddInput; block_table=None goes through fine despite
-    // identical metadata. To unblock dense mode, we always hand aclnn a non-null tensor:
-    //   - if user passed a real sparse_indices, use it.
-    //   - if user passed None (dense mode), substitute a 1-element int32 dummy on NPU.
-    // The tiling-side detects dense by tensor rank (real sparse is rank 3 or 4), so the dummy
-    // routes correctly to the IS_DENSE=1 template instance.
+    // [step 3c workaround — final]
+    // For sparse_indices=None (dense mode), instead of fighting CANN's runtime nullptr-checks
+    // and StorageShape::GetDimNum semantic surprises (see earlier commits), we substitute a
+    // SHAPE-COMPLIANT tensor whose content selects every token: a full-coverage arange.
+    // With sparse_block_size forced to 1 and indices = [0, 1, ..., S2-1], the existing sparse
+    // path mathematically computes dense FA. No special host/kernel dense branch is exercised
+    // for this call path; CompareShape passes naturally because the shape matches what tiling
+    // expects.
     at::Tensor sparse_indices_passthrough;
+    int64_t effective_sparse_block_size = sparse_block_size;
     if (sparse_indices.has_value()) {
         sparse_indices_passthrough = sparse_indices.value();
     } else {
-        sparse_indices_passthrough = at::zeros(
-            {1}, query.options().dtype(at::kInt));
+        // Compute S2 (max KV seq length) and N2 per layout_kv
+        int64_t S2;
+        int64_t N2;
+        if (layout_kv_str == "PA_BSND") {
+            TORCH_CHECK(block_table.has_value(),
+                        "sparse_flash_attention: PA_BSND mode requires block_table");
+            int64_t block_size = key.size(1);              // [block_num, block_size, N2, D]
+            int64_t max_blocks_per_batch = block_table.value().size(1);
+            S2 = max_blocks_per_batch * block_size;
+            N2 = key.size(2);
+        } else if (layout_kv_str == "TND") {
+            S2 = key.size(0);                              // [T2, N2, D]
+            N2 = key.size(1);
+        } else {                                            // BSND
+            S2 = key.size(1);                              // [B, S2, N2, D]
+            N2 = key.size(2);
+        }
+        TORCH_CHECK(S2 > 0 && N2 > 0,
+                    "sparse_flash_attention dense substitute: S2=", S2, " N2=", N2);
+        effective_sparse_block_size = 1;
+        int64_t K = S2;
+
+        auto arange = at::arange(K, query.options().dtype(at::kInt));
+        if (layout_query_str == "TND") {
+            int64_t T1 = query.size(0);
+            sparse_indices_passthrough =
+                arange.view({1, 1, K}).expand({T1, N2, K}).contiguous();
+        } else {                                            // BSND
+            int64_t B = query.size(0);
+            int64_t S1 = query.size(1);
+            sparse_indices_passthrough =
+                arange.view({1, 1, 1, K}).expand({B, S1, N2, K}).contiguous();
+        }
     }
 
     EXEC_NPU_CMD(
@@ -97,7 +128,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
         query_rope,
         key_rope,
         scale_value,
-        sparse_block_size,
+        effective_sparse_block_size,
         layout_query_ptr,
         layout_kv_ptr,
         sparse_mode,
