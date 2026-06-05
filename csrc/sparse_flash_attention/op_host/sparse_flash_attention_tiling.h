@@ -107,7 +107,7 @@ struct SFAParaInfo {
     SFARequiredParaInfo query = {nullptr, nullptr};
     SFARequiredParaInfo key = {nullptr, nullptr};
     SFARequiredParaInfo value = {nullptr, nullptr};
-    SFARequiredParaInfo sparseIndices = {nullptr, nullptr};
+    SFAOptionalParaInfo sparseIndices = {nullptr, nullptr};
     SFAOptionalParaInfo blockTable = {nullptr, nullptr};
     SFAOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
     SFAOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
@@ -246,6 +246,7 @@ struct SFATilingInfo {
 
     uint32_t sparseMode = 0;
     bool returnSoftmaxLse = false;
+    bool isDenseMode = false;
 
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKvType = ge::DT_FLOAT16;

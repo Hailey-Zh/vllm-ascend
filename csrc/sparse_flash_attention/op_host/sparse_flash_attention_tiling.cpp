@@ -704,11 +704,14 @@ ge::graphStatus SFATilingCheck::CheckSinglePara() const
 {
     if (ge::GRAPH_SUCCESS != CheckSingleParaQuery() ||
         ge::GRAPH_SUCCESS != CheckSingleParaKey() ||
-        ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices() || 
         ge::GRAPH_SUCCESS != CheckSingleParaNumHeads() ||
         ge::GRAPH_SUCCESS != CheckSingleParaKvHeadNums() ||
         ge::GRAPH_SUCCESS != CheckSingleParaSparseMode() ||
         ge::GRAPH_SUCCESS != CheckSingleParaSparseBlockSize()) {
+        return ge::GRAPH_FAILED;
+    }
+    if (!sfaInfo_.isDenseMode &&
+        ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices()) {
         return ge::GRAPH_FAILED;
     }
 
@@ -855,7 +858,9 @@ ge::graphStatus SFATilingCheck::GetActualSeqLenSize(uint32_t &size, const gert::
 void SFATilingCheck::SetSFAShapeCompare()
 {
     queryShapeCmp_ = opParamInfo_.query.shape->GetStorageShape();
-    topkShapeCmp_ = opParamInfo_.sparseIndices.shape->GetStorageShape();
+    if (opParamInfo_.sparseIndices.tensor != nullptr) {
+        topkShapeCmp_ = opParamInfo_.sparseIndices.tensor->GetStorageShape();
+    }
     keyShapeCmp_ = opParamInfo_.key.shape->GetStorageShape();
     valueShapeCmp_ = opParamInfo_.value.shape->GetStorageShape();
     attenOutShapeCmp_ = opParamInfo_.attenOut.shape->GetStorageShape();
@@ -952,6 +957,9 @@ ge::graphStatus SFATilingCheck::CheckQRope()
 
 ge::graphStatus SFATilingCheck::CheckTopK()
 {
+    if (sfaInfo_.isDenseMode) {
+        return ge::GRAPH_SUCCESS;
+    }
     if (ge::GRAPH_SUCCESS != CheckTopkShape()) {
         return ge::GRAPH_FAILED;
     }
@@ -1358,10 +1366,7 @@ ge::graphStatus SFAInfoParser::CheckRequiredInOutExistence() const
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(opParamInfo_.value.desc == nullptr, OPS_LOG_E(opName_, "Desc of tensor value is nullptr"),
                return ge::GRAPH_FAILED);
-    OPS_ERR_IF(opParamInfo_.sparseIndices.shape == nullptr, OPS_LOG_E(opName_, "Shape of tensor sparseIndices is nullptr"),
-               return ge::GRAPH_FAILED);
-    OPS_ERR_IF(opParamInfo_.sparseIndices.desc == nullptr, OPS_LOG_E(opName_, "Desc of tensor sparseIndices is nullptr"),
-               return ge::GRAPH_FAILED);
+    // sparseIndices is OPTIONAL — null is allowed (dense mode signal).
     OPS_ERR_IF(opParamInfo_.attenOut.shape == nullptr, OPS_LOG_E(opName_, "Shape of tensor output is nullptr"),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(opParamInfo_.attenOut.desc == nullptr, OPS_LOG_E(opName_, "Desc of tensor output is nullptr"),
@@ -1476,8 +1481,9 @@ void SFAInfoParser::GetInputParaInfo()
     opParamInfo_.key.shape = context_->GetInputShape(KEY_INPUT_INDEX);
     opParamInfo_.value.desc = context_->GetInputDesc(VALUE_INPUT_INDEX);
     opParamInfo_.value.shape = context_->GetInputShape(VALUE_INPUT_INDEX);
-    opParamInfo_.sparseIndices.desc = context_->GetInputDesc(SPARSE_INDICES_INPUT_INDEX);
-    opParamInfo_.sparseIndices.shape = context_->GetInputShape(SPARSE_INDICES_INPUT_INDEX);
+    // sparseIndices 现在是 OPTIONAL：用 GetOptionalInput* 拿 desc/tensor，null 表示 dense 模式
+    opParamInfo_.sparseIndices.desc = context_->GetOptionalInputDesc(SPARSE_INDICES_INPUT_INDEX);
+    opParamInfo_.sparseIndices.tensor = context_->GetOptionalInputTensor(SPARSE_INDICES_INPUT_INDEX);
     GetOptionalInputParaInfo();
 }
 
@@ -1642,6 +1648,11 @@ ge::graphStatus SFAInfoParser::GetBlockSize()
 
 ge::graphStatus SFAInfoParser::GetSparseBlockCount()
 {
+    if (opParamInfo_.sparseIndices.tensor == nullptr) {
+        // dense mode: 3b 会填真实回退值 (ceil(actualKvSeqLen)); 这里占位 0
+        sparseBlockCount_ = 0;
+        return ge::GRAPH_SUCCESS;
+    }
     sparseBlockCount_ = GetAxisNum(sparseIndicesShape_, SFAAxis::K, qLayout_);
 
     return ge::GRAPH_SUCCESS;
@@ -1718,7 +1729,9 @@ void SFAInfoParser::SetSFAShape()
     queryShape_ = opParamInfo_.query.shape->GetStorageShape();
     keyShape_ = opParamInfo_.key.shape->GetStorageShape();
     valueShape_ = opParamInfo_.value.shape->GetStorageShape();
-    sparseIndicesShape_ = opParamInfo_.sparseIndices.shape->GetStorageShape();
+    if (opParamInfo_.sparseIndices.tensor != nullptr) {
+        sparseIndicesShape_ = opParamInfo_.sparseIndices.tensor->GetStorageShape();
+    }
     queryRopeShape_ = opParamInfo_.queryRope.tensor->GetStorageShape();
 }
 
@@ -1788,6 +1801,7 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
 
     sfaInfo.sparseMode = *opParamInfo_.sparseMode;
     sfaInfo.returnSoftmaxLse = (opParamInfo_.returnSoftmaxLse != nullptr) && *opParamInfo_.returnSoftmaxLse;
+    sfaInfo.isDenseMode = (opParamInfo_.sparseIndices.tensor == nullptr);
 
     sfaInfo.qLayout = qLayout_;
     sfaInfo.topkLayout = topkLayout_;
@@ -1839,6 +1853,15 @@ ge::graphStatus SFAInfoParser::Parse(SFATilingInfo &sfaInfo)
     }
 
     GenerateInfo(sfaInfo);
+
+    // [step 3a temporary guard] dense mode (sparse_indices == None) 还没接 kernel，
+    // 会在 step 3b/3c 落地。此拦截会在 3b 第一件事删除。
+    if (sfaInfo.isDenseMode) {
+        OPS_LOG_E(opName_,
+            "sparse_indices is None (dense mode) is not yet supported; "
+            "will be enabled in step 3b/3c. Please pass sparse_indices for now.");
+        return ge::GRAPH_FAILED;
+    }
     return ge::GRAPH_SUCCESS;
 }
 

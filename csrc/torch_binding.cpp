@@ -662,7 +662,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def(
         "npu_sparse_flash_attention(Tensor query, Tensor key, Tensor value,"
-        "                           Tensor sparse_indices, float scale_value, int sparse_block_size, *,"
+        "                           Tensor? sparse_indices, float scale_value, int sparse_block_size, *,"
         "                           Tensor? block_table=None, Tensor? actual_seq_lengths_query=None,"
         "                           Tensor? actual_seq_lengths_kv=None, Tensor? query_rope=None,"
         "                           Tensor? key_rope=None, str layout_query='BSND', str layout_kv='BSND',"
