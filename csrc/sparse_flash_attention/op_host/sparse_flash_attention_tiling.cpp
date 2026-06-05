@@ -354,9 +354,23 @@ void SFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_actualLenDimsKV(sfaInfo_->actualLenDimsKV);
     tilingData_.baseParams.set_outputLayout(static_cast<uint32_t>(sfaInfo_->outLayout));
     tilingData_.baseParams.set_sparseMode(sfaInfo_->sparseMode);
-    tilingData_.baseParams.set_sparseBlockSize(sfaInfo_->sparseBlockSize);
-    tilingData_.baseParams.set_sparseBlockCount(sfaInfo_->sparseBlockCount);
+    // [bug fix] 防御性地在 fill tiling data 之前再次计算 dense 状态，避免依赖
+    // sfaInfo_->sparseBlockSize/Count 字段（万一 GenerateInfo 的 dense override 因
+    // isDenseMode 字段读写异常没生效，这里能兜底）。
+    const auto *si = sfaInfo_->opParamInfo.sparseIndices.tensor;
+    bool dense = sfaInfo_->isDenseMode ||
+                 (si == nullptr) ||
+                 (si != nullptr && si->GetStorageShape().GetDimNum() == 1U);
+    int64_t effectiveSparseBlockSize = dense ? 1 : sfaInfo_->sparseBlockSize;
+    int64_t effectiveSparseBlockCount =
+        dense ? static_cast<int64_t>(sfaInfo_->s2Size) : sfaInfo_->sparseBlockCount;
+    tilingData_.baseParams.set_sparseBlockSize(effectiveSparseBlockSize);
+    tilingData_.baseParams.set_sparseBlockCount(effectiveSparseBlockCount);
     tilingData_.baseParams.set_returnSoftmaxLse(sfaInfo_->returnSoftmaxLse ? 1U : 0U);
+    OPS_LOG_I(sfaInfo_->opName,
+              "SFA FillTiling: dense=%d, effectiveSparseBlockSize=%ld, effectiveSparseBlockCount=%ld, s2Size=%ld",
+              dense, effectiveSparseBlockSize, effectiveSparseBlockCount,
+              static_cast<int64_t>(sfaInfo_->s2Size));
 }
 
 // for flash decode
@@ -1831,13 +1845,21 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
     //   2. tensor rank == 1  — the dummy 1-element tensor that torch_adpt.h substitutes for None
     //      (real sparse_indices is rank 3 for TND or rank 4 for BSND — never rank 1, no ambiguity)
     bool denseFromNull = (opParamInfo_.sparseIndices.tensor == nullptr);
-    bool denseFromDummy = (opParamInfo_.sparseIndices.tensor != nullptr &&
-                           opParamInfo_.sparseIndices.tensor->GetStorageShape().GetDimNum() == 1U);
-    sfaInfo.isDenseMode = denseFromNull || denseFromDummy;
+    bool denseFromDummy = false;
+    if (opParamInfo_.sparseIndices.tensor != nullptr) {
+        denseFromDummy = (opParamInfo_.sparseIndices.tensor->GetStorageShape().GetDimNum() == 1U);
+    }
+    bool dense = denseFromNull || denseFromDummy;
+    sfaInfo.isDenseMode = dense;
+    OPS_LOG_I(opName_,
+              "SFA isDenseMode: tensor=%p, denseFromNull=%d, denseFromDummy=%d, final=%d",
+              opParamInfo_.sparseIndices.tensor, denseFromNull, denseFromDummy, dense);
     // step 3b: dense 模式下覆盖 sparseBlockSize/Count，使 sparseBlockCount * sparseBlockSize >= s2Size
     //          ——这样现有 kernel 公式 min(sparseBlockCount*sparseBlockSize, threshold) 会退化成 threshold，
     //          配合 3c 的 if constexpr (SFAT::isDense) 分支后即为正确的稠密 FA。
-    if (sfaInfo.isDenseMode) {
+    // [bug fix] 用本地变量 `dense`，不依赖 sfaInfo.isDenseMode 字段读回——
+    //           上次测试显示 SFATilingCheck 读这个字段读到 false，原因未明；用本地变量绕过。
+    if (dense) {
         sfaInfo.sparseBlockSize = 1;
         sfaInfo.sparseBlockCount = static_cast<int64_t>(s2Size_);
     }
