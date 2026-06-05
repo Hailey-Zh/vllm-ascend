@@ -240,13 +240,18 @@ void SFAMlaTiling::GenTilingKey()
     uint32_t outputType = static_cast<uint32_t>(sfaInfo_->outputType);
     uint32_t layoutQuery = static_cast<uint32_t>(sfaInfo_->qLayout);
     uint32_t layoutKV = static_cast<uint32_t>(sfaInfo_->kvLayout);
-    // step 3b: dense 维度独立编码进 tiling key；与 IS_DENSE 模板参数对齐
-    uint32_t isDense = sfaInfo_->isDenseMode ? 1U : 0U;
+    // 与 SFATilingCheck 一致：dense 信号从 sparseIndices tensor 直接判，不依赖 sfaInfo_->isDenseMode 字段。
+    // 兜底防御：若 isDenseMode 字段传播异常，tiling key 仍能拿到正确的 IS_DENSE bit。
+    const auto *si = sfaInfo_->opParamInfo.sparseIndices.tensor;
+    bool dense = sfaInfo_->isDenseMode ||
+                 (si == nullptr) ||
+                 (si != nullptr && si->GetStorageShape().GetDimNum() == 1U);
+    uint32_t isDense = dense ? 1U : 0U;
 
     tilingKey_ = GET_TPL_TILING_KEY(0U, layoutQuery, layoutKV,
                                     perfMode_ == SFAPerfMode::V_TEMPLATE_MODE, isDense);
 
-    OPS_LOG_I(sfaInfo_->opName, "SFA tilingKey_: %lu.", tilingKey_);
+    OPS_LOG_I(sfaInfo_->opName, "SFA tilingKey_: %lu, isDense=%u.", tilingKey_, isDense);
 }
 
 void SFAMlaTiling::ZeroTensorProcess()
@@ -263,8 +268,13 @@ void SFAMlaTiling::InitParams()
     } else {
         perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
     }
-    // step 3b: dense 模式只走 C_TEMPLATE（V_TEMPLATE 的 KV merge 路径不适用稠密）
-    if (sfaInfo_->isDenseMode) {
+    // step 3b/3c: dense 模式只走 C_TEMPLATE（V_TEMPLATE 的 KV merge 路径不适用稠密）。
+    // 同 GenTilingKey 的防御：从 tensor 形态直接判，不依赖 sfaInfo_->isDenseMode 字段。
+    const auto *si = sfaInfo_->opParamInfo.sparseIndices.tensor;
+    bool dense = sfaInfo_->isDenseMode ||
+                 (si == nullptr) ||
+                 (si != nullptr && si->GetStorageShape().GetDimNum() == 1U);
+    if (dense) {
         perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
     }
 
@@ -717,8 +727,12 @@ ge::graphStatus SFATilingCheck::CheckSinglePara() const
         ge::GRAPH_SUCCESS != CheckSingleParaSparseBlockSize()) {
         return ge::GRAPH_FAILED;
     }
-    if (!sfaInfo_.isDenseMode &&
-        ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices()) {
+    // dense 模式（tensor == nullptr 或 rank == 1 的 dummy）下跳过 sparse_indices dtype 检查。
+    // 直接看 opParamInfo_（Init() 刚刚复制过来，肯定是最新的），不读 sfaInfo_.isDenseMode 字段，
+    // 防止任何 SFATilingInfo 字段传播/ABI 异常导致漏判。
+    const auto *si = opParamInfo_.sparseIndices.tensor;
+    bool dense = (si == nullptr) || (si->GetStorageShape().GetDimNum() == 1U);
+    if (!dense && ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices()) {
         return ge::GRAPH_FAILED;
     }
 
@@ -964,7 +978,11 @@ ge::graphStatus SFATilingCheck::CheckQRope()
 
 ge::graphStatus SFATilingCheck::CheckTopK()
 {
-    if (sfaInfo_.isDenseMode) {
+    // dense 模式跳过 topk shape check。直接看 tensor 形态，不依赖 sfaInfo_.isDenseMode。
+    // 见 CheckSinglePara 注释。
+    const auto *si = opParamInfo_.sparseIndices.tensor;
+    bool dense = (si == nullptr) || (si->GetStorageShape().GetDimNum() == 1U);
+    if (dense) {
         return ge::GRAPH_SUCCESS;
     }
     if (ge::GRAPH_SUCCESS != CheckTopkShape()) {
