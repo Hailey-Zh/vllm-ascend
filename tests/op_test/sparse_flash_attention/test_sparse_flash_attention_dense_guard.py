@@ -26,6 +26,9 @@ import pytest
 import torch
 import torch_npu  # noqa: F401  # registers npu device
 import vllm_ascend  # noqa: F401  # registers torch.ops._C_ascend
+from vllm_ascend.utils import enable_custom_op
+
+enable_custom_op()
 
 
 def _build_minimal_bsnd_inputs():
