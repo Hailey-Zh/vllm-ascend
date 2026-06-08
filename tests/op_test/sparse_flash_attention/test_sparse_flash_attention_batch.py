@@ -17,7 +17,10 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm_ascend.utils import enable_custom_op
 import utils
+
+enable_custom_op()
 
 
 TESTCASE_PATH = os.environ.get("PT_FILES_PATH", "./pt_files/")

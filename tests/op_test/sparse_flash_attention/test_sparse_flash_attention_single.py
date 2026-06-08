@@ -14,8 +14,11 @@ import os
 from pathlib import Path
 import concurrent.futures
 import pytest
+from vllm_ascend.utils import enable_custom_op
 import utils
 import sparse_flash_attention_golden
+
+enable_custom_op()
 
 PT_SAVE_PATH = "./pt_files/"
 DEVICE_ID = 0
