@@ -17,7 +17,8 @@
 #define SPARSE_FLASH_ATTENTION_TORCH_ADPT_H
 namespace vllm_ascend {
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor,
+           c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>>
 npu_sparse_flash_attention(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const c10::optional<at::Tensor> &sparse_indices, double scale_value, int64_t sparse_block_size,
@@ -118,44 +119,42 @@ npu_sparse_flash_attention(
         }
     }
 
-    // [step 4] packed KV 输出。
-    // 重要：CANN aclnn 即使元数据标了 OPTIONAL，运行期对输出传 nullopt 仍会让 executor
-    // 匹配不到 binary（报 "binary bin not found" / NnopbaseExecutorMatchCache failed），
-    // 与历史上 OPTIONAL 输入拒绝 null 同源（见 dense 的 sparse_indices dummy 替换）。
-    // 因此始终分配真实 shape 的张量；return_packed_kv=false 时 kernel 不写、只占位。
+    // [step 4] packed KV 输出。OPTIONAL：return_packed_kv=false 时传 nullopt、不分配显存。
+    c10::optional<at::Tensor> packed_key;
+    c10::optional<at::Tensor> packed_key_rope;
+    c10::optional<at::Tensor> actual_packed_len;
     if (return_packed_kv) {
         // 仅支持稀疏 + sparseBlockSize<=4（MergeKv 硬约束，tiling 侧也会校验）
         TORCH_CHECK(sparse_indices.has_value(),
             "return_packed_kv only supports sparse mode (sparse_indices must be provided)");
         TORCH_CHECK(sparse_block_size <= 4,
             "return_packed_kv only supports sparse_block_size <= 4, got ", sparse_block_size);
+
+        int64_t n2 = (layout_kv_str == "TND") ? key.size(1) : key.size(2);
+        // S2 = sparse_block_count(sparse_indices 末维) * sparse_block_size
+        int64_t sparse_block_count = sparse_indices.value().size(-1);
+        int64_t s2 = sparse_block_count * sparse_block_size;
+        int64_t head_dim = key.size(-1);
+        int64_t rope_dim = key_rope.has_value() ? key_rope.value().size(-1) : 64;
+
+        std::vector<int64_t> pk_shape, pkr_shape, len_shape;
+        if (layout_query_str == "TND") {
+            int64_t t1 = query.size(0);
+            pk_shape  = {t1, n2, s2, head_dim};
+            pkr_shape = {t1, n2, s2, rope_dim};
+            len_shape = {t1, n2};
+        } else {  // BSND
+            int64_t b = query.size(0);
+            int64_t s1 = query.size(1);
+            pk_shape  = {b, s1, n2, s2, head_dim};
+            pkr_shape = {b, s1, n2, s2, rope_dim};
+            len_shape = {b, s1, n2};
+        }
+        // padding/尾部清零由 kernel 负责，host 端 at::empty 不必清。
+        packed_key       = at::empty(pk_shape,  query.options().dtype(query.dtype()));
+        packed_key_rope  = at::empty(pkr_shape, query.options().dtype(query.dtype()));
+        actual_packed_len = at::empty(len_shape, query.options().dtype(at::kInt));
     }
-    int64_t pkv_n2 = (layout_kv_str == "TND") ? key.size(1) : key.size(2);
-    // S2 = sparse_block_count(sparse_indices 末维) * effective_sparse_block_size，
-    // 与 proto.cpp InferShape 一致（dense 替换路径下 effective=1、indices 为全选 arange）。
-    int64_t pkv_s2 = sparse_indices_passthrough.size(-1) * effective_sparse_block_size;
-    int64_t pkv_head_dim = key.size(-1);
-    int64_t pkv_rope_dim = key_rope.has_value() ? key_rope.value().size(-1) : 64;
-    std::vector<int64_t> pk_shape, pkr_shape, len_shape;
-    if (layout_query_str == "TND") {
-        int64_t t1 = query.size(0);
-        pk_shape  = {t1, pkv_n2, pkv_s2, pkv_head_dim};
-        pkr_shape = {t1, pkv_n2, pkv_s2, pkv_rope_dim};
-        len_shape = {t1, pkv_n2};
-    } else {  // BSND
-        int64_t b = query.size(0);
-        int64_t s1 = query.size(1);
-        pk_shape  = {b, s1, pkv_n2, pkv_s2, pkv_head_dim};
-        pkr_shape = {b, s1, pkv_n2, pkv_s2, pkv_rope_dim};
-        len_shape = {b, s1, pkv_n2};
-    }
-    // padding/尾部清零由 kernel 负责，host 端 at::empty 不必清。
-    at::Tensor packed_key =
-        at::empty(pk_shape, query.options().dtype(query.dtype()));
-    at::Tensor packed_key_rope =
-        at::empty(pkr_shape, query.options().dtype(query.dtype()));
-    at::Tensor actual_packed_len =
-        at::empty(len_shape, query.options().dtype(at::kInt));
 
     EXEC_NPU_CMD(
         aclnnSparseFlashAttention,

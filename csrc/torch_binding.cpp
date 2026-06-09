@@ -668,7 +668,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                           Tensor? key_rope=None, str layout_query='BSND', str layout_kv='BSND',"
         "                           int sparse_mode=3, bool return_softmax_lse=False,"
         "                           bool return_packed_kv=False)"
-        " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+        " -> (Tensor, Tensor, Tensor, Tensor?, Tensor?, Tensor?)"
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
 
