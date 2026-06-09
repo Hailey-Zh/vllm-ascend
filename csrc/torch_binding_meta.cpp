@@ -266,36 +266,40 @@ npu_sparse_flash_attention_meta(
     at::Tensor softmax_max = at::empty(lse_shape, lse_options);
     at::Tensor softmax_sum = at::empty(lse_shape, lse_options);
 
-    // [step 4] packed KV 输出，与 torch_adpt.h 保持一致
-    c10::optional<at::Tensor> packed_key;
-    c10::optional<at::Tensor> packed_key_rope;
-    c10::optional<at::Tensor> actual_packed_len;
+    // [step 4] packed KV 输出，与 torch_adpt.h 保持一致：始终分配（aclnn 不接受 nullopt 输出）。
     if (return_packed_kv) {
         TORCH_CHECK(sparse_indices.has_value(),
             "return_packed_kv only supports sparse mode (sparse_indices must be provided)");
         TORCH_CHECK(sparse_block_size <= 4,
             "return_packed_kv only supports sparse_block_size <= 4, got ", sparse_block_size);
-        int64_t n2 = (layout_kv_str == "TND") ? key.size(1) : key.size(2);
-        int64_t s2 = sparse_indices.value().size(-1) * sparse_block_size;
-        int64_t head_dim = key.size(-1);
-        int64_t rope_dim = key_rope.has_value() ? key_rope.value().size(-1) : 64;
-        std::vector<int64_t> pk_shape, pkr_shape, len_shape;
-        if (layout_query_str == "TND") {
-            int64_t t1 = query.size(0);
-            pk_shape = {t1, n2, s2, head_dim};
-            pkr_shape = {t1, n2, s2, rope_dim};
-            len_shape = {t1, n2};
-        } else {
-            int64_t b = query.size(0);
-            int64_t s1 = query.size(1);
-            pk_shape = {b, s1, n2, s2, head_dim};
-            pkr_shape = {b, s1, n2, s2, rope_dim};
-            len_shape = {b, s1, n2};
-        }
-        packed_key = at::empty(pk_shape, query.options().dtype(query.dtype()));
-        packed_key_rope = at::empty(pkr_shape, query.options().dtype(query.dtype()));
-        actual_packed_len = at::empty(len_shape, query.options().dtype(at::kInt));
     }
+    int64_t pkv_n2 = (layout_kv_str == "TND") ? key.size(1) : key.size(2);
+    // meta 侧没有 dense 替换逻辑；sparse_indices 缺失时退化用 key 的 S2 维兜底（仅 false 占位用）。
+    int64_t pkv_block_count = sparse_indices.has_value()
+        ? sparse_indices.value().size(-1)
+        : ((layout_kv_str == "TND") ? key.size(0) : key.size(1));
+    int64_t pkv_s2 = pkv_block_count * sparse_block_size;
+    int64_t pkv_head_dim = key.size(-1);
+    int64_t pkv_rope_dim = key_rope.has_value() ? key_rope.value().size(-1) : 64;
+    std::vector<int64_t> pk_shape, pkr_shape, len_shape;
+    if (layout_query_str == "TND") {
+        int64_t t1 = query.size(0);
+        pk_shape = {t1, pkv_n2, pkv_s2, pkv_head_dim};
+        pkr_shape = {t1, pkv_n2, pkv_s2, pkv_rope_dim};
+        len_shape = {t1, pkv_n2};
+    } else {
+        int64_t b = query.size(0);
+        int64_t s1 = query.size(1);
+        pk_shape = {b, s1, pkv_n2, pkv_s2, pkv_head_dim};
+        pkr_shape = {b, s1, pkv_n2, pkv_s2, pkv_rope_dim};
+        len_shape = {b, s1, pkv_n2};
+    }
+    c10::optional<at::Tensor> packed_key =
+        at::empty(pk_shape, query.options().dtype(query.dtype()));
+    c10::optional<at::Tensor> packed_key_rope =
+        at::empty(pkr_shape, query.options().dtype(query.dtype()));
+    c10::optional<at::Tensor> actual_packed_len =
+        at::empty(len_shape, query.options().dtype(at::kInt));
     return std::make_tuple(output, softmax_max, softmax_sum,
                            packed_key, packed_key_rope, actual_packed_len);
 }
