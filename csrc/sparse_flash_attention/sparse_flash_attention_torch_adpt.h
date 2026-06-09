@@ -17,8 +17,7 @@
 #define SPARSE_FLASH_ATTENTION_TORCH_ADPT_H
 namespace vllm_ascend {
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor,
-           c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 npu_sparse_flash_attention(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const c10::optional<at::Tensor> &sparse_indices, double scale_value, int64_t sparse_block_size,
@@ -151,11 +150,11 @@ npu_sparse_flash_attention(
         len_shape = {b, s1, pkv_n2};
     }
     // padding/尾部清零由 kernel 负责，host 端 at::empty 不必清。
-    c10::optional<at::Tensor> packed_key =
+    at::Tensor packed_key =
         at::empty(pk_shape, query.options().dtype(query.dtype()));
-    c10::optional<at::Tensor> packed_key_rope =
+    at::Tensor packed_key_rope =
         at::empty(pkr_shape, query.options().dtype(query.dtype()));
-    c10::optional<at::Tensor> actual_packed_len =
+    at::Tensor actual_packed_len =
         at::empty(len_shape, query.options().dtype(at::kInt));
 
     EXEC_NPU_CMD(

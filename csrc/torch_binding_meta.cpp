@@ -230,8 +230,7 @@ at::Tensor npu_lightning_indexer_meta(
     return lightning_indexer_output;
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor,
-           c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 npu_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const c10::optional<at::Tensor> &sparse_indices, double scale_value, int64_t sparse_block_size,
@@ -294,11 +293,11 @@ npu_sparse_flash_attention_meta(
         pkr_shape = {b, s1, pkv_n2, pkv_s2, pkv_rope_dim};
         len_shape = {b, s1, pkv_n2};
     }
-    c10::optional<at::Tensor> packed_key =
+    at::Tensor packed_key =
         at::empty(pk_shape, query.options().dtype(query.dtype()));
-    c10::optional<at::Tensor> packed_key_rope =
+    at::Tensor packed_key_rope =
         at::empty(pkr_shape, query.options().dtype(query.dtype()));
-    c10::optional<at::Tensor> actual_packed_len =
+    at::Tensor actual_packed_len =
         at::empty(len_shape, query.options().dtype(at::kInt));
     return std::make_tuple(output, softmax_max, softmax_sum,
                            packed_key, packed_key_rope, actual_packed_len);

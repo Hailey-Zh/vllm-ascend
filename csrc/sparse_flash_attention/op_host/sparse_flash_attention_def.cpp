@@ -77,20 +77,23 @@ public:
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT, ge::DT_FLOAT})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-        // [step 4] packed KV 输出。OPTIONAL：return_packed_kv=false 时调用方传 nullopt、不分配。
+        // [step 4] packed KV 输出。必须 REQUIRED：本算子是 AOT 静态编译(ASCENDC_TPL)，
+        // binary 匹配不支持 optional 输出（optional 会报 "binary bin not found"）。
+        // 与能 work 的 softmax_max/sum 一致用 REQUIRED；无论 return_packed_kv 真假都分配，
+        // false 时 kernel 不写、仅占位。
         // packed_key = 选中 token 的 c_KV(NoPE)，与 query 同 dtype；下游同时当 key 和 value。
         this->Output("packed_key")
-            .ParamType(OPTIONAL)
+            .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
         // packed_key_rope = 选中 token 的 RoPE-K，与 query 同 dtype。
         this->Output("packed_key_rope")
-            .ParamType(OPTIONAL)
+            .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
         // actual_packed_len = 每个 (b,s1,n2) 段有效 token 数。
         this->Output("actual_packed_len")
-            .ParamType(OPTIONAL)
+            .ParamType(REQUIRED)
             .DataType({ge::DT_INT32, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Attr("scale_value").AttrType(REQUIRED).Float(1.0);
