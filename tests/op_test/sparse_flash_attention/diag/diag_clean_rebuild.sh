@@ -99,7 +99,16 @@ case "$MODE" in
 esac
 
 echo "=== 验证：算子是否重新注册 ==="
-python -c "import torch, vllm_ascend; print('npu_sparse_flash_attention registered:', hasattr(torch.ops._C_ascend, 'npu_sparse_flash_attention'))"
+# 注意：必须 enable_custom_op() 才会真正加载/注册自定义算子，
+# 光 import vllm_ascend 不会，hasattr 会是 False（误判）。
+python -c "
+import torch
+import torch_npu  # noqa: registers npu device
+import vllm_ascend  # noqa
+from vllm_ascend.utils import enable_custom_op
+enable_custom_op()
+print('npu_sparse_flash_attention registered:', hasattr(torch.ops._C_ascend, 'npu_sparse_flash_attention'))
+"
 echo
 echo "=== 全部完成。建议接着跑回归： ==="
 echo "    cd tests/op_test/sparse_flash_attention && bash test_run.sh single"
