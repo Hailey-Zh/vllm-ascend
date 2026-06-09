@@ -230,7 +230,9 @@ at::Tensor npu_lightning_indexer_meta(
     return lightning_indexer_output;
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
+std::tuple<at::Tensor, at::Tensor, at::Tensor,
+           c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>>
+npu_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const c10::optional<at::Tensor> &sparse_indices, double scale_value, int64_t sparse_block_size,
     const c10::optional<at::Tensor> &block_table,
@@ -240,7 +242,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     const c10::optional<at::Tensor> &key_rope, c10::string_view layout_query,
     c10::string_view layout_kv,
     int64_t sparse_mode,
-    bool return_softmax_lse)
+    bool return_softmax_lse,
+    bool return_packed_kv)
 {
     std::string layout_query_str = std::string(layout_query);
     std::string layout_kv_str = std::string(layout_kv);
@@ -262,7 +265,39 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     auto lse_options = query.options().dtype(at::kFloat);
     at::Tensor softmax_max = at::empty(lse_shape, lse_options);
     at::Tensor softmax_sum = at::empty(lse_shape, lse_options);
-    return std::make_tuple(output, softmax_max, softmax_sum);
+
+    // [step 4] packed KV 输出，与 torch_adpt.h 保持一致
+    c10::optional<at::Tensor> packed_key;
+    c10::optional<at::Tensor> packed_key_rope;
+    c10::optional<at::Tensor> actual_packed_len;
+    if (return_packed_kv) {
+        TORCH_CHECK(sparse_indices.has_value(),
+            "return_packed_kv only supports sparse mode (sparse_indices must be provided)");
+        TORCH_CHECK(sparse_block_size <= 4,
+            "return_packed_kv only supports sparse_block_size <= 4, got ", sparse_block_size);
+        int64_t n2 = (layout_kv_str == "TND") ? key.size(1) : key.size(2);
+        int64_t s2 = sparse_indices.value().size(-1) * sparse_block_size;
+        int64_t head_dim = key.size(-1);
+        int64_t rope_dim = key_rope.has_value() ? key_rope.value().size(-1) : 64;
+        std::vector<int64_t> pk_shape, pkr_shape, len_shape;
+        if (layout_query_str == "TND") {
+            int64_t t1 = query.size(0);
+            pk_shape = {t1, n2, s2, head_dim};
+            pkr_shape = {t1, n2, s2, rope_dim};
+            len_shape = {t1, n2};
+        } else {
+            int64_t b = query.size(0);
+            int64_t s1 = query.size(1);
+            pk_shape = {b, s1, n2, s2, head_dim};
+            pkr_shape = {b, s1, n2, s2, rope_dim};
+            len_shape = {b, s1, n2};
+        }
+        packed_key = at::empty(pk_shape, query.options().dtype(query.dtype()));
+        packed_key_rope = at::empty(pkr_shape, query.options().dtype(query.dtype()));
+        actual_packed_len = at::empty(len_shape, query.options().dtype(at::kInt));
+    }
+    return std::make_tuple(output, softmax_max, softmax_sum,
+                           packed_key, packed_key_rope, actual_packed_len);
 }
 std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(
     const at::Tensor &x1,

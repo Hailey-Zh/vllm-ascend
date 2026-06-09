@@ -68,6 +68,8 @@ public:
                                 __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
                                 __gm__ uint8_t *attentionOut,
                                 __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+                                __gm__ uint8_t *packedKey, __gm__ uint8_t *packedKeyRope,
+                                __gm__ uint8_t *actualPackedLen,
                                 __gm__ uint8_t *workspace,
                                 const SparseFlashAttentionTilingDataMla *__restrict tiling,
 				                __gm__ uint8_t *gmTiling, TPipe *tPipe);
@@ -143,6 +145,10 @@ private:
     GlobalTensor<OUT_T> attentionOutGm;
     GlobalTensor<T> softmaxMaxGm;
     GlobalTensor<T> softmaxSumGm;
+    // [step 4] packed KV 输出（4a 仅接指针，写入在 4b）
+    GlobalTensor<KV_T> packedKeyGm_;
+    GlobalTensor<KV_T> packedKeyRopeGm_;
+    GlobalTensor<int32_t> actualPackedLenGm_;
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topKGm;
 
@@ -413,6 +419,8 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
                        __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
                        __gm__ uint8_t *attentionOut,
                        __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+                       __gm__ uint8_t *packedKey, __gm__ uint8_t *packedKeyRope,
+                       __gm__ uint8_t *actualPackedLen,
                        __gm__ uint8_t *workspace,
                        const SparseFlashAttentionTilingDataMla *__restrict tiling,
                        __gm__ uint8_t *gmTiling, TPipe *tPipe)
@@ -446,6 +454,10 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
     attentionOutGm.SetGlobalBuffer((__gm__ OUT_T *)attentionOut);
     softmaxMaxGm.SetGlobalBuffer((__gm__ T *)softmaxMax);
     softmaxSumGm.SetGlobalBuffer((__gm__ T *)softmaxSum);
+    // [step 4] 仅接指针；return_packed_kv=false 时这些为 nullptr，4a 不读不写。
+    packedKeyGm_.SetGlobalBuffer((__gm__ KV_T *)packedKey);
+    packedKeyRopeGm_.SetGlobalBuffer((__gm__ KV_T *)packedKeyRope);
+    actualPackedLenGm_.SetGlobalBuffer((__gm__ int32_t *)actualPackedLen);
 
     if ASCEND_IS_AIV {
         if (constInfo.needInit && LAYOUT_T != SFA_LAYOUT::TND) {

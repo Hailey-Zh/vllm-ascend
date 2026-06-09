@@ -22,22 +22,33 @@ using namespace ge;
 namespace ops {
 constexpr size_t QUERY_INPUT_INDEX = 0;
 constexpr size_t KEY_INPUT_INDEX = 1;
+constexpr size_t SPARSE_INDICES_INPUT_INDEX = 3;  // [step 4] 用于推 S2
+constexpr size_t KEY_ROPE_INPUT_INDEX = 8;        // [step 4] 用于推 ropeDim
 
 constexpr uint32_t DIM_NUM_1 = 1;
+constexpr uint32_t DIM_NUM_2 = 2;
 constexpr uint32_t DIM_NUM_3 = 3;
 constexpr uint32_t DIM_NUM_4 = 4;
+constexpr uint32_t DIM_NUM_5 = 5;
 constexpr uint32_t DIM_INDEX_0 = 0;
 constexpr uint32_t DIM_INDEX_1 = 1;
 constexpr uint32_t DIM_INDEX_2 = 2;
 constexpr uint32_t DIM_INDEX_3 = 3;
+constexpr uint32_t DIM_INDEX_4 = 4;
+
+constexpr int64_t DEFAULT_ROPE_DIM = 64;  // [step 4] key_rope 缺失时的 MLA RoPE 维度兜底
 
 // 属性顺序对齐 def.cpp
+constexpr uint32_t SPARSE_BLOCK_SIZE_ATTR_INDEX = 1;  // [step 4]
 constexpr uint32_t LAYOUT_KV_ATTR_INDEX = 3;
 constexpr uint32_t RETURN_SOFTMAX_LSE_ATTR_INDEX = 5;
 
 constexpr uint32_t OUTPUT_INDEX_0 = 0;  // attention_out
 constexpr uint32_t OUTPUT_INDEX_1 = 1;  // softmax_max
 constexpr uint32_t OUTPUT_INDEX_2 = 2;  // softmax_sum
+constexpr uint32_t OUTPUT_INDEX_3 = 3;  // [step 4] packed_key
+constexpr uint32_t OUTPUT_INDEX_4 = 4;  // [step 4] packed_key_rope
+constexpr uint32_t OUTPUT_INDEX_5 = 5;  // [step 4] actual_packed_len
 
 ge::graphStatus InferShapeSparseFlashAttention(gert::InferShapeContext *context)
 {
@@ -100,6 +111,75 @@ ge::graphStatus InferShapeSparseFlashAttention(gert::InferShapeContext *context)
         softmaxSumShape->SetDim(DIM_INDEX_2, s1);
         softmaxSumShape->SetDim(DIM_INDEX_3, g);
     }
+
+    // [step 4] packed_key / packed_key_rope / actual_packed_len。
+    // OPTIONAL 输出：return_packed_kv=false 时调用方传 nullopt，GetOutputShape 返回 nullptr → 跳过。
+    gert::Shape *packedKeyShape = context->GetOutputShape(OUTPUT_INDEX_3);
+    gert::Shape *packedKeyRopeShape = context->GetOutputShape(OUTPUT_INDEX_4);
+    gert::Shape *actualPackedLenShape = context->GetOutputShape(OUTPUT_INDEX_5);
+    if (packedKeyShape != nullptr && packedKeyRopeShape != nullptr && actualPackedLenShape != nullptr) {
+        const gert::Shape *sparseIndicesShape = context->GetInputShape(SPARSE_INDICES_INPUT_INDEX);
+        OPS_LOG_E_IF_NULL(context, sparseIndicesShape, return ge::GRAPH_FAILED)
+        const int64_t *sparseBlockSizePtr = attrs->GetAttrPointer<int64_t>(SPARSE_BLOCK_SIZE_ATTR_INDEX);
+        OPS_LOG_E_IF_NULL(context, sparseBlockSizePtr, return ge::GRAPH_FAILED)
+        // S2 = sparse_block_count(sparse_indices 末维) * sparse_block_size(attr)
+        int64_t sparseBlockCount = sparseIndicesShape->GetDim(sparseIndicesShape->GetDimNum() - 1);
+        int64_t s2 = sparseBlockCount * (*sparseBlockSizePtr);
+        // headDim 取 key 末维；ropeDim 取 key_rope 末维（缺失则兜底 64）
+        int64_t headDim = keyShape->GetDim(keyShape->GetDimNum() - 1);
+        int64_t ropeDim = DEFAULT_ROPE_DIM;
+        const gert::Shape *keyRopeShape = context->GetInputShape(KEY_ROPE_INPUT_INDEX);
+        if (keyRopeShape != nullptr && keyRopeShape->GetDimNum() > 0) {
+            ropeDim = keyRopeShape->GetDim(keyRopeShape->GetDimNum() - 1);
+        }
+
+        if (queryShape->GetDimNum() == DIM_NUM_3) {
+            // TND: packed_key [T1, N2, S2, headDim]，actual_packed_len [T1, N2]
+            int64_t n2 = (layoutKvStr == "PA_BSND") ? keyShape->GetDim(DIM_INDEX_2)
+                                                    : keyShape->GetDim(DIM_INDEX_1);
+            int64_t t1 = queryShape->GetDim(DIM_INDEX_0);
+
+            packedKeyShape->SetDimNum(DIM_NUM_4);
+            packedKeyShape->SetDim(DIM_INDEX_0, t1);
+            packedKeyShape->SetDim(DIM_INDEX_1, n2);
+            packedKeyShape->SetDim(DIM_INDEX_2, s2);
+            packedKeyShape->SetDim(DIM_INDEX_3, headDim);
+
+            packedKeyRopeShape->SetDimNum(DIM_NUM_4);
+            packedKeyRopeShape->SetDim(DIM_INDEX_0, t1);
+            packedKeyRopeShape->SetDim(DIM_INDEX_1, n2);
+            packedKeyRopeShape->SetDim(DIM_INDEX_2, s2);
+            packedKeyRopeShape->SetDim(DIM_INDEX_3, ropeDim);
+
+            actualPackedLenShape->SetDimNum(DIM_NUM_2);
+            actualPackedLenShape->SetDim(DIM_INDEX_0, t1);
+            actualPackedLenShape->SetDim(DIM_INDEX_1, n2);
+        } else {
+            // BSND: packed_key [B, S1, N2, S2, headDim]，actual_packed_len [B, S1, N2]
+            int64_t b = queryShape->GetDim(DIM_INDEX_0);
+            int64_t s1 = queryShape->GetDim(DIM_INDEX_1);
+            int64_t n2 = keyShape->GetDim(DIM_INDEX_2);
+
+            packedKeyShape->SetDimNum(DIM_NUM_5);
+            packedKeyShape->SetDim(DIM_INDEX_0, b);
+            packedKeyShape->SetDim(DIM_INDEX_1, s1);
+            packedKeyShape->SetDim(DIM_INDEX_2, n2);
+            packedKeyShape->SetDim(DIM_INDEX_3, s2);
+            packedKeyShape->SetDim(DIM_INDEX_4, headDim);
+
+            packedKeyRopeShape->SetDimNum(DIM_NUM_5);
+            packedKeyRopeShape->SetDim(DIM_INDEX_0, b);
+            packedKeyRopeShape->SetDim(DIM_INDEX_1, s1);
+            packedKeyRopeShape->SetDim(DIM_INDEX_2, n2);
+            packedKeyRopeShape->SetDim(DIM_INDEX_3, s2);
+            packedKeyRopeShape->SetDim(DIM_INDEX_4, ropeDim);
+
+            actualPackedLenShape->SetDimNum(DIM_NUM_3);
+            actualPackedLenShape->SetDim(DIM_INDEX_0, b);
+            actualPackedLenShape->SetDim(DIM_INDEX_1, s1);
+            actualPackedLenShape->SetDim(DIM_INDEX_2, n2);
+        }
+    }
     return GRAPH_SUCCESS;
 }
 
@@ -111,6 +191,10 @@ ge::graphStatus InferDataTypeSparseFlashAttention(gert::InferDataTypeContext *co
     context->SetOutputDataType(OUTPUT_INDEX_0, inputDataType);
     context->SetOutputDataType(OUTPUT_INDEX_1, ge::DT_FLOAT);
     context->SetOutputDataType(OUTPUT_INDEX_2, ge::DT_FLOAT);
+    // [step 4] packed_key / packed_key_rope 与 query 同 dtype；actual_packed_len = int32
+    context->SetOutputDataType(OUTPUT_INDEX_3, inputDataType);
+    context->SetOutputDataType(OUTPUT_INDEX_4, inputDataType);
+    context->SetOutputDataType(OUTPUT_INDEX_5, ge::DT_INT32);
     return ge::GRAPH_SUCCESS;
 }
 

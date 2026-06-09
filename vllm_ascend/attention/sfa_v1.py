@@ -913,7 +913,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv = kv_cache[0]
         key_rope = kv_cache[1]
 
-        attn_output, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
+        attn_output, _, _, _, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv,
             value=kv,

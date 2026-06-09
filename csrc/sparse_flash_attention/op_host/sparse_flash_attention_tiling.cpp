@@ -267,6 +267,11 @@ void SFAMlaTiling::InitParams()
     if (sfaInfo_->isDenseMode) {
         perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
     }
+    // step 4: return_packed_kv 必须走 V_TEMPLATE（只有它有 MergeKv 拼接机制）。
+    // 合法性（sparseBlockSize<=4 且非 dense）已在 SFAInfoParser::Parse 校验，这里仅强制选路。
+    if (sfaInfo_->returnPackedKv) {
+        perfMode_ = SFAPerfMode::V_TEMPLATE_MODE;
+    }
 
     coreNum_ = aicNum_;
 
@@ -347,6 +352,7 @@ void SFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_sparseBlockSize(sfaInfo_->sparseBlockSize);
     tilingData_.baseParams.set_sparseBlockCount(sfaInfo_->sparseBlockCount);
     tilingData_.baseParams.set_returnSoftmaxLse(sfaInfo_->returnSoftmaxLse ? 1U : 0U);
+    tilingData_.baseParams.set_returnPackedKv(sfaInfo_->returnPackedKv ? 1U : 0U);  // [step 4]
 }
 
 // for flash decode
@@ -1512,6 +1518,7 @@ ge::graphStatus SFAInfoParser::GetAttrParaInfo()
     opParamInfo_.scaleValue = attrs->GetAttrPointer<float>(SCALE_VALUE_ATTR_INDEX);
     opParamInfo_.sparseMode = attrs->GetAttrPointer<int64_t>(SPARSE_MODE_ATTR_INDEX);
     opParamInfo_.returnSoftmaxLse = attrs->GetAttrPointer<bool>(RETURN_SOFTMAX_LSE_ATTR_INDEX);
+    opParamInfo_.returnPackedKv = attrs->GetAttrPointer<bool>(RETURN_PACKED_KV_ATTR_INDEX);  // [step 4]
 
     return ge::GRAPH_SUCCESS;
 }
@@ -1808,6 +1815,7 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
 
     sfaInfo.sparseMode = *opParamInfo_.sparseMode;
     sfaInfo.returnSoftmaxLse = (opParamInfo_.returnSoftmaxLse != nullptr) && *opParamInfo_.returnSoftmaxLse;
+    sfaInfo.returnPackedKv = (opParamInfo_.returnPackedKv != nullptr) && *opParamInfo_.returnPackedKv;  // [step 4]
     // [step 3a/3c] dense 模式：tensor == nullptr 时为 dense。
     // 当前 torch_adpt.h 走的是"生成合法 shape 的 sparse_indices + arange 全选"路径，
     // 不会让 tensor == nullptr 到达这里（aclnn auto-gen 也会先 reject nullptr）。
@@ -1869,6 +1877,14 @@ ge::graphStatus SFAInfoParser::Parse(SFATilingInfo &sfaInfo)
     }
 
     GenerateInfo(sfaInfo);
+    // [step 4] return_packed_kv 仅支持稀疏 + sparseBlockSize<=4（MergeKv 的硬约束，见 vector_mla.h）
+    if (sfaInfo.returnPackedKv && (sfaInfo.sparseBlockSize > 4 || sfaInfo.isDenseMode)) {
+        OPS_LOG_E("SparseFlashAttention",
+            "return_packed_kv only supports sparse mode with sparseBlockSize<=4, "
+            "but got sparseBlockSize=%ld isDenseMode=%d.",
+            sfaInfo.sparseBlockSize, static_cast<int>(sfaInfo.isDenseMode));
+        return ge::GRAPH_FAILED;
+    }
     return ge::GRAPH_SUCCESS;
 }
 

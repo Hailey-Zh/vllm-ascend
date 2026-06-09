@@ -128,11 +128,11 @@ def _run_pair_and_compare(case, tag):
         "query_rope", "key_rope", "layout_query", "layout_kv")}
 
     # Run A: sparse 路径 + 全选 indices
-    out_sparse, _, _ = _call_op(sparse_indices=case["sparse_indices_full"], **common_kwargs)
+    out_sparse = _call_op(sparse_indices=case["sparse_indices_full"], **common_kwargs)[0]
     torch.npu.synchronize()
 
     # Run B: dense 路径
-    out_dense, _, _ = _call_op(sparse_indices=None, **common_kwargs)
+    out_dense = _call_op(sparse_indices=None, **common_kwargs)[0]
     torch.npu.synchronize()
 
     out_sparse_cpu = out_sparse.float().cpu()

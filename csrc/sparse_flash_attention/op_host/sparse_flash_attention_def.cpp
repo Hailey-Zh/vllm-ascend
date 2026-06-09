@@ -77,12 +77,29 @@ public:
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT, ge::DT_FLOAT})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        // [step 4] packed KV 输出。OPTIONAL：return_packed_kv=false 时调用方传 nullopt、不分配。
+        // packed_key = 选中 token 的 c_KV(NoPE)，与 query 同 dtype；下游同时当 key 和 value。
+        this->Output("packed_key")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        // packed_key_rope = 选中 token 的 RoPE-K，与 query 同 dtype。
+        this->Output("packed_key_rope")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        // actual_packed_len = 每个 (b,s1,n2) 段有效 token 数。
+        this->Output("actual_packed_len")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_INT32, ge::DT_INT32})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Attr("scale_value").AttrType(REQUIRED).Float(1.0);
         this->Attr("sparse_block_size").AttrType(REQUIRED).Int(1);
         this->Attr("layout_query").AttrType(OPTIONAL).String("BSND");
         this->Attr("layout_kv").AttrType(OPTIONAL).String("BSND");
         this->Attr("sparse_mode").AttrType(OPTIONAL).Int(3);
         this->Attr("return_softmax_lse").AttrType(OPTIONAL).Bool(false);
+        this->Attr("return_packed_kv").AttrType(OPTIONAL).Bool(false);
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)
