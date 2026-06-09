@@ -116,6 +116,22 @@ case "$MODE" in
         ;;
 esac
 
+# [关键] 安装完 CANN 算子包后，必须 source set_env.bash 才能让运行期找到 kernel 二进制，
+# 否则执行算子报 EZ9999 AclNN_Inner_Error: "The binary bin not found!"（官方解释为
+# "检查环境变量是否正确"）。注意：脚本里 source 只对本脚本 shell 生效，退出后不保留，
+# 所以下面既在脚本内 source（让本脚本的验证可用），也在结尾打印命令提醒你在自己的 shell 再跑一次。
+SET_ENV="$ROOT_DIR/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/bin/set_env.bash"
+if [[ -f "$SET_ENV" ]]; then
+    echo "=== source set_env.bash（注册算子二进制查找路径） ==="
+    # shellcheck disable=SC1090
+    source "$SET_ENV"
+    echo "    sourced: $SET_ENV"
+    echo
+else
+    echo "[WARN] 未找到 $SET_ENV（layer2-only 模式且从未建过算子包？）" >&2
+    echo
+fi
+
 echo "=== 验证：算子是否重新注册 ==="
 # 注意：必须 enable_custom_op() 才会真正加载/注册自定义算子，
 # 光 import vllm_ascend 不会，hasattr 会是 False（误判）。
@@ -128,5 +144,11 @@ enable_custom_op()
 print('npu_sparse_flash_attention registered:', hasattr(torch.ops._C_ascend, 'npu_sparse_flash_attention'))
 "
 echo
-echo "=== 全部完成。建议接着跑回归： ==="
-echo "    cd tests/op_test/sparse_flash_attention && bash test_run.sh single"
+echo "################################################################################"
+echo "# 跑回归前，必须先在你当前的 shell 里 source 环境变量（脚本里的 source 不会留到你的 shell）："
+echo "#"
+echo "#   source $SET_ENV"
+echo "#"
+echo "# 然后："
+echo "#   cd tests/op_test/sparse_flash_attention && bash test_run.sh single"
+echo "################################################################################"
