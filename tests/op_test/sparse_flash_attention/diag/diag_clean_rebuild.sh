@@ -42,6 +42,13 @@ rebuild_layer1() {
         echo "[FATAL] 重建层1（CANN 算子包）需要 <soc> 参数，例如 ascend910b" >&2
         exit 1
     fi
+    # build_aclnn.sh 只认 ^ascend910b / ^ascend910_93，其它值会静默 exit 0 什么都不建。
+    # 这里先拦住，避免 rm vendors 之后又空跑，导致 "binary bin not found"。
+    if [[ ! "$SOC" =~ ^ascend910b && ! "$SOC" =~ ^ascend910_93 ]]; then
+        echo "[FATAL] soc='$SOC' 不被 build_aclnn.sh 支持（只认 ascend910b* / ascend910_93*）。" >&2
+        echo "        传错 soc 会让 build_aclnn.sh 静默 exit 0、不构建任何算子。" >&2
+        exit 1
+    fi
     echo "=== [层1] 清理 CANN 算子包产物 ==="
     echo "    删除: csrc/build  csrc/output  vllm_ascend/_cann_ops_custom/vendors"
     rm -rf csrc/build csrc/output vllm_ascend/_cann_ops_custom/vendors
@@ -55,9 +62,20 @@ rebuild_layer1() {
         echo "        没同步 → binary gen 报 template mismatch / no matching function。" >&2
         exit $rc
     fi
+    # 关键校验：build_aclnn.sh 可能 rc=0 却没产出（soc 静默 exit 0，或 kernel binary gen
+    # 失败但未传播）。这里确认 sparse_flash_attention 的产物真的进了 vendors，否则运行期
+    # 会报 "binary bin not found"。
+    local sfa_artifacts
+    sfa_artifacts=$(find vllm_ascend/_cann_ops_custom/vendors -iname "*sparse_flash_attention*" 2>/dev/null | head -5)
+    if [[ -z "$sfa_artifacts" ]]; then
+        echo "[FATAL] 层1 build 后 vendors 里找不到 sparse_flash_attention 产物！" >&2
+        echo "        说明算子包没真正构建（soc 空跑 / kernel binary gen 失败）。" >&2
+        echo "        请检查上面的 build 日志里 sparse_flash_attention 段是否有 error / no matching function。" >&2
+        exit 1
+    fi
     echo "=== [层1] 完成 ==="
-    echo "    已安装包内容:"
-    ls -d vllm_ascend/_cann_ops_custom/vendors/* 2>/dev/null
+    echo "    sparse_flash_attention 产物（节选）:"
+    echo "$sfa_artifacts"
     echo
 }
 
