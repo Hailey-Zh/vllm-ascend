@@ -887,7 +887,11 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
                              constInfo.headDimRope * sizeof(KV_T);
     }
     
-    if (unlikely(keySrcStride >= INT32_MAX || keySrcStride < 0 ||
+    // [step 4b] return_packed_kv 时强制走逐 token 的 CopyInSingleKv 路径：双块 strided 拷贝按内存
+    // 升序读会打乱顺序（注意力无所谓，但 packed 要求严格 sparse_indices 顺序）。逐 token 路径
+    // 按 (realS2Idx1, realS2Idx2) 的选择顺序写入 UB → flush 到 packed 即 sparse_indices 顺序。
+    if (unlikely(constInfo.returnPackedKv ||
+        keySrcStride >= INT32_MAX || keySrcStride < 0 ||
         (!PAGE_ATTENTION && (keyRopeSrcStride >= INT32_MAX || keyRopeSrcStride < 0)) ||
         realS2Idx1 + constInfo.sparseBlockSize >= s2IdLimit ||
         realS2Idx2 + constInfo.sparseBlockSize >= s2IdLimit)) {
