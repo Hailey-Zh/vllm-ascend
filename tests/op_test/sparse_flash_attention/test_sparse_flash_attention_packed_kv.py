@@ -114,3 +114,95 @@ def test_packed_kv_bsnd_gather():
     # 纯拷贝，应逐元素一致（留极小容差防 dtype 往返）
     assert torch.allclose(pk, exp_key, rtol=0, atol=1e-3), f"packed_key mismatch max={max_key:.3e}"
     assert torch.allclose(pkr, exp_rope, rtol=0, atol=1e-3), f"packed_key_rope mismatch max={max_rope:.3e}"
+
+
+@pytest.mark.step4_packed_kv
+def test_packed_kv_tnd_pa_bsnd_marker():
+    """生产路径 TND query + PA_BSND kv，跨 batch（测 TND 前缀和段基址 + PA block_table 间址 + 保序）。
+    用 marker 编码：把每个 kv token 的整段向量填成它的全局标号 (b*BASE + pos)，packed 出来直接验标号。
+    """
+    torch.manual_seed(11)
+    device, dtype = "npu", torch.float16
+    N1, N2, D, ROPE = 8, 1, 512, 64        # MLA: N2=1, gSize=N1
+    BS = 64                                  # PA block size
+    BASE = 1000                              # marker = b*BASE + pos（<2048，fp16 精确）
+
+    # 两 batch，query 长度 [2,3] → T1=5；actual_seq_q 用 cumsum（TND 约定）
+    q_len = [2, 3]
+    T1 = sum(q_len)                          # 5
+    cum_q = [2, 5]
+    actual_seq_q = torch.tensor(cum_q, dtype=torch.int32, device=device)
+
+    # 每 batch kv 长度 128（2 块）；actual_seq_kv 用 RAW 每 batch（PA 约定）
+    kv_len = [128, 128]
+    BLOCKS_PER_BATCH = 2                      # 128/64
+    B = 2
+    BLOCK_NUM = B * BLOCKS_PER_BATCH         # 4
+    actual_seq_kv = torch.tensor(kv_len, dtype=torch.int32, device=device)
+    # block_table[b] = [b*2, b*2+1]
+    block_table = torch.arange(BLOCK_NUM, dtype=torch.int32, device=device).view(B, BLOCKS_PER_BATCH)
+
+    # key/value/key_rope cache：[BLOCK_NUM, BS, N2, *]，每个 token 整段填 marker
+    key_cache = torch.zeros(BLOCK_NUM, BS, N2, D, dtype=dtype, device=device)
+    key_rope_cache = torch.zeros(BLOCK_NUM, BS, N2, ROPE, dtype=dtype, device=device)
+    for b in range(B):
+        for p in range(kv_len[b]):
+            phys = int(block_table[b, p // BS].item())
+            off = p % BS
+            marker = float(b * BASE + p)
+            key_cache[phys, off, 0, :] = marker
+            key_rope_cache[phys, off, 0, :] = marker
+    value = key_cache  # MLA: value==c_KV; 不被 V_TEMPLATE 读，传同一份
+
+    query = torch.randn(T1, N1, D, dtype=dtype, device=device) * 0.1
+    query_rope = torch.randn(T1, N1, ROPE, dtype=dtype, device=device) * 0.1
+
+    K = 8
+    # sparse_indices: [T1, N2, K]，每个 query token 选 K 个不同 kv 位置（其所在 batch 的 [0,kv_len)）
+    sel = torch.empty(T1, N2, K, dtype=torch.int32)
+    def t1_to_b(t1):
+        return 0 if t1 < cum_q[0] else 1
+    for t1 in range(T1):
+        b = t1_to_b(t1)
+        for n2 in range(N2):
+            sel[t1, n2] = torch.randperm(kv_len[b])[:K].to(torch.int32)
+    sparse_indices = sel.to(device)
+
+    out, _, _, packed_key, packed_key_rope = torch.ops._C_ascend.npu_sparse_flash_attention(
+        query=query, key=key_cache, value=value,
+        sparse_indices=sparse_indices,
+        scale_value=SCALE,
+        sparse_block_size=1,
+        block_table=block_table,
+        actual_seq_lengths_query=actual_seq_q,
+        actual_seq_lengths_kv=actual_seq_kv,
+        query_rope=query_rope, key_rope=key_rope_cache,
+        layout_query="TND", layout_kv="PA_BSND",
+        sparse_mode=0,
+        return_softmax_lse=False,
+        return_packed_kv=True,
+    )
+    torch.npu.synchronize()
+
+    assert packed_key is not None and packed_key_rope is not None
+    assert tuple(packed_key.shape) == (T1, N2, K, D), f"packed_key shape {tuple(packed_key.shape)}"
+    assert tuple(packed_key_rope.shape) == (T1, N2, K, ROPE), f"packed_key_rope shape {tuple(packed_key_rope.shape)}"
+
+    pk = packed_key.float().cpu()
+    pkr = packed_key_rope.float().cpu()
+    # 期望 marker：packed_key[t1,n2,i,:] 全 == b(t1)*BASE + sel[t1,n2,i]
+    sel_cpu = sel.cpu()
+    bad = 0
+    max_diff = 0.0
+    for t1 in range(T1):
+        b = t1_to_b(t1)
+        for n2 in range(N2):
+            for i in range(K):
+                want = float(b * BASE + int(sel_cpu[t1, n2, i]))
+                dk = (pk[t1, n2, i] - want).abs().max().item()
+                dr = (pkr[t1, n2, i] - want).abs().max().item()
+                max_diff = max(max_diff, dk, dr)
+                if dk > 0.5 or dr > 0.5:
+                    bad += 1
+    print(f"[packed_kv TND/PA_BSND] max_marker_diff={max_diff:.3e} bad_slots={bad}")
+    assert bad == 0, f"TND/PA_BSND packed marker mismatch: {bad} slots wrong, max_diff={max_diff:.3e}"
