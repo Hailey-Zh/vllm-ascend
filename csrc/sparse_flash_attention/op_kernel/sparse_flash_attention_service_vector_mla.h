@@ -44,7 +44,10 @@ public:
     __aicore__ inline void InitVec0GlobalTensor(const GlobalTensor<int32_t> &kvValidSizeGm,
                                                 const GlobalTensor<KV_T> &kvMergeGm,
                                                 const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm,
-                                                const GlobalTensor<int32_t> &blkTableGm);
+                                                const GlobalTensor<int32_t> &blkTableGm,
+                                                const GlobalTensor<KV_T> &packedKeyGm,
+                                                const GlobalTensor<KV_T> &packedKeyRopeGm,
+                                                const GlobalTensor<int32_t> &actualPackedLenGm);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<KV_T> vec1ResGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsQGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsKVGm, GlobalTensor<T> lseMaxFdGm,
@@ -71,7 +74,8 @@ public:
     __aicore__ inline void CopyInKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx1,
                                     int64_t realS2Idx2, const RunInfo &runInfo);
     __aicore__ inline void CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
-                                             int64_t mergeMte3Idx, const RunInfo &runInfo);
+                                             int64_t mergeMte3Idx, const RunInfo &runInfo,
+                                             int64_t packedKeyBase, int64_t packedRopeBase);
     __aicore__ inline void SetInfInBlk(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
                                        uint64_t startId, uint64_t endId);
     __aicore__ inline void SetMidInf(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
@@ -169,6 +173,10 @@ private:
     GlobalTensor<KV_T> keyGm_;
     GlobalTensor<int32_t> topkGm_;
     GlobalTensor<int32_t> kvValidSizeGm_;
+    // [step 4b] packed KV 输出（Strategy B：与 workspace 并排写）
+    GlobalTensor<KV_T> packedKeyGm_;
+    GlobalTensor<KV_T> packedKeyRopeGm_;
+    GlobalTensor<int32_t> actualPackedLenGm_;
 
     // ================================Local Buffer====================================
     TBuf<> inputBuff1;            // 32K
@@ -260,13 +268,18 @@ SFAVectorService<SFAT>::InitMm2ResInt32GmGlobalTensor(GlobalTensor<int32_t> mm2R
 template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::InitVec0GlobalTensor(
     const GlobalTensor<int32_t> &kvValidSizeGm, const GlobalTensor<KV_T> &kvMergeGm,
-    const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm, const GlobalTensor<int32_t> &blkTableGm)
+    const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm, const GlobalTensor<int32_t> &blkTableGm,
+    const GlobalTensor<KV_T> &packedKeyGm, const GlobalTensor<KV_T> &packedKeyRopeGm,
+    const GlobalTensor<int32_t> &actualPackedLenGm)
 {
     this->kvMergeGm_ = kvMergeGm;
     this->keyRopeGm_ = keyRopeGm;
     this->keyGm_ = keyGm;
     this->blkTableGm_ = blkTableGm;
     this->kvValidSizeGm_ = kvValidSizeGm;
+    this->packedKeyGm_ = packedKeyGm;
+    this->packedKeyRopeGm_ = packedKeyRopeGm;
+    this->actualPackedLenGm_ = actualPackedLenGm;
 }
 
 template <typename SFAT>
@@ -911,7 +924,8 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
 template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size,
                                                                  int64_t s2GmStartOffset, int64_t mergeMte3Idx,
-                                                                 const RunInfo &runInfo)
+                                                                 const RunInfo &runInfo,
+                                                                 int64_t packedKeyBase, int64_t packedRopeBase)
 {
     if (mte2Size <= mte3Size) {
         return;
@@ -928,9 +942,21 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyOutMrgeResult(int64_t mte2Siz
     DataCopyPad(kvMergeGm_[runInfo.loop % 4 * 512 * 576 + (s2GmStartOffset + mte3Size)*constInfo.headDim],
                 kvMergUb_[mergeMte3Idx % 2 * 32 * 512], dataCopyParams);
 
+    // [step 4b] Strategy B：从同一 UB 并排写一份到 packed_key（NoPE）。段内位置 = s2GmStartOffset+mte3Size。
+    if (constInfo.returnPackedKv) {
+        DataCopyPad(packedKeyGm_[packedKeyBase + (s2GmStartOffset + mte3Size) * constInfo.headDim],
+                    kvMergUb_[mergeMte3Idx % 2 * 32 * 512], dataCopyParams);
+    }
+
     dataCopyParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
     DataCopyPad(kvMergeGm_[runInfo.loop % 4 * 512 * 576 + 512 * 512 + (s2GmStartOffset + mte3Size) *
                 constInfo.headDimRope], ropeMergUb_[mergeMte3Idx % 2 * 32 * 64], dataCopyParams);
+
+    // [step 4b] packed_key_rope（RoPE）。注意 packed 是独立 tensor，无 workspace 的 512*512 偏移。
+    if (constInfo.returnPackedKv) {
+        DataCopyPad(packedKeyRopeGm_[packedRopeBase + (s2GmStartOffset + mte3Size) * constInfo.headDimRope],
+                    ropeMergUb_[mergeMte3Idx % 2 * 32 * 64], dataCopyParams);
+    }
 }
 
 // b s1 k
@@ -948,6 +974,24 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
     } else {
         topkGmBaseOffset += runInfo.bIdx * constInfo.qSeqSize * constInfo.sparseBlockCount +
                             runInfo.gS1Idx / constInfo.gSize * constInfo.sparseBlockCount;
+    }
+    // [step 4b] packed 输出段基址。layout [B/T1, N2, S2, dim]，S2 = sparseBlockCount*sparseBlockSize。
+    // segLinear 与 topkGmBaseOffset 同款分支，只是把 stride 从 sparseBlockCount 换成 S2*dim。
+    // V_TEMPLATE 一段一次 MergeKv，段内位置就是 s2GmOffset，无需 chunkBase。
+    int64_t packedKeyBase = 0;
+    int64_t packedRopeBase = 0;
+    if (constInfo.returnPackedKv) {
+        int64_t packedS2 = constInfo.sparseBlockCount * constInfo.sparseBlockSize;
+        int64_t segLinear;
+        if constexpr (LAYOUT_T == SFA_LAYOUT::TND) {
+            uint64_t prefixSum = (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsQGm.GetValue(runInfo.bIdx - 1);
+            segLinear = (prefixSum + runInfo.gS1Idx / constInfo.gSize) * constInfo.kvHeadNum + runInfo.n2Idx;
+        } else {
+            segLinear = (runInfo.bIdx * constInfo.qSeqSize + runInfo.gS1Idx / constInfo.gSize) *
+                        constInfo.kvHeadNum + runInfo.n2Idx;
+        }
+        packedKeyBase = segLinear * packedS2 * constInfo.headDim;
+        packedRopeBase = segLinear * packedS2 * constInfo.headDimRope;
     }
     int64_t mergeMte3Idx = 0;
     int64_t mte2Size = 0;
@@ -969,7 +1013,8 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
         }
         GetRealS2Idx(s2GmOffsetArray, s2IdxArray0, topkGmBaseOffset, runInfo);
         if (unlikely(s2IdxArray0 < 0)) {
-            CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
+            CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo,
+                              packedKeyBase, packedRopeBase);
             SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
             mergeMte3Idx++;
             break;
@@ -978,7 +1023,8 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
         CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1, runInfo);
         if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > 32) ||
             s2GmOffsetArray + 2 * constInfo.sparseBlockSize >= s2GmLimit) {
-            CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
+            CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo,
+                              packedKeyBase, packedRopeBase);
             mte3Size = mte2Size;
             SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
             mergeMte3Idx++;
@@ -1002,12 +1048,21 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
         for (int64_t s2GmOffset = s2GmStartOffset + mte2Size; s2GmOffset < s2GmLimit; s2GmOffset++) {
             DataCopyPad(kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 + s2GmOffset * constInfo.headDim],
                         kvMergUb_, dataCopyParams);
+            // [step 4b] 处理范围内未填部分清零同步写到 packed_key
+            if (constInfo.returnPackedKv) {
+                DataCopyPad(packedKeyGm_[packedKeyBase + s2GmOffset * constInfo.headDim], kvMergUb_, dataCopyParams);
+            }
         }
         dataCopyParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
         for (int64_t s2GmOffset = s2GmStartOffset + mte2Size; s2GmOffset < s2GmLimit; s2GmOffset++) {
             DataCopyPad(kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 + 512 * constInfo.headDim +
                                    s2GmOffset * constInfo.headDimRope],
                         kvMergUb_, dataCopyParams);
+            // [step 4b] 同步写到 packed_key_rope
+            if (constInfo.returnPackedKv) {
+                DataCopyPad(packedKeyRopeGm_[packedRopeBase + s2GmOffset * constInfo.headDimRope],
+                            kvMergUb_, dataCopyParams);
+            }
         }
         SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx & 1);
         mergeMte3Idx++;
