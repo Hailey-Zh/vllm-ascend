@@ -225,6 +225,7 @@ template <typename SFAT> __aicore__ inline void SparseFlashAttentionMla<SFAT>::I
     constInfo.sparseBlockCount = tilingData->baseParams.sparseBlockCount;
     constInfo.sparseMode = tilingData->baseParams.sparseMode;
     constInfo.returnSoftmaxLse = (tilingData->baseParams.returnSoftmaxLse != 0U);
+    constInfo.returnPackedKv = (tilingData->baseParams.returnPackedKv != 0U);  // [step 4b]
 
     constInfo.preLoadNum = PRELOAD_NUM;
     constInfo.nBufferMBaseSize = N_BUFFER_M_BASIC_SIZE;

@@ -154,6 +154,7 @@ struct ConstInfo {
     uint32_t sparseMode = 0;
     bool needInit = false;
     bool returnSoftmaxLse = false;
+    bool returnPackedKv = false;  // [step 4b]
 
     // FlashDecoding
     uint32_t actualCombineLoopSize = 0U;
