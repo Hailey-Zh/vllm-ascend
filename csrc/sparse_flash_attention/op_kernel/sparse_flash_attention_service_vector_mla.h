@@ -46,8 +46,7 @@ public:
                                                 const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm,
                                                 const GlobalTensor<int32_t> &blkTableGm,
                                                 const GlobalTensor<KV_T> &packedKeyGm,
-                                                const GlobalTensor<KV_T> &packedKeyRopeGm,
-                                                const GlobalTensor<int32_t> &actualPackedLenGm);
+                                                const GlobalTensor<KV_T> &packedKeyRopeGm);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<KV_T> vec1ResGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsQGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsKVGm, GlobalTensor<T> lseMaxFdGm,
@@ -176,7 +175,6 @@ private:
     // [step 4b] packed KV 输出（Strategy B：与 workspace 并排写）
     GlobalTensor<KV_T> packedKeyGm_;
     GlobalTensor<KV_T> packedKeyRopeGm_;
-    GlobalTensor<int32_t> actualPackedLenGm_;
 
     // ================================Local Buffer====================================
     TBuf<> inputBuff1;            // 32K
@@ -269,8 +267,7 @@ template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::InitVec0GlobalTensor(
     const GlobalTensor<int32_t> &kvValidSizeGm, const GlobalTensor<KV_T> &kvMergeGm,
     const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm, const GlobalTensor<int32_t> &blkTableGm,
-    const GlobalTensor<KV_T> &packedKeyGm, const GlobalTensor<KV_T> &packedKeyRopeGm,
-    const GlobalTensor<int32_t> &actualPackedLenGm)
+    const GlobalTensor<KV_T> &packedKeyGm, const GlobalTensor<KV_T> &packedKeyRopeGm)
 {
     this->kvMergeGm_ = kvMergeGm;
     this->keyRopeGm_ = keyRopeGm;
@@ -279,7 +276,6 @@ __aicore__ inline void SFAVectorService<SFAT>::InitVec0GlobalTensor(
     this->kvValidSizeGm_ = kvValidSizeGm;
     this->packedKeyGm_ = packedKeyGm;
     this->packedKeyRopeGm_ = packedKeyRopeGm;
-    this->actualPackedLenGm_ = actualPackedLenGm;
 }
 
 template <typename SFAT>
@@ -1048,21 +1044,12 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
         for (int64_t s2GmOffset = s2GmStartOffset + mte2Size; s2GmOffset < s2GmLimit; s2GmOffset++) {
             DataCopyPad(kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 + s2GmOffset * constInfo.headDim],
                         kvMergUb_, dataCopyParams);
-            // [step 4b] 处理范围内未填部分清零同步写到 packed_key
-            if (constInfo.returnPackedKv) {
-                DataCopyPad(packedKeyGm_[packedKeyBase + s2GmOffset * constInfo.headDim], kvMergUb_, dataCopyParams);
-            }
         }
         dataCopyParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
         for (int64_t s2GmOffset = s2GmStartOffset + mte2Size; s2GmOffset < s2GmLimit; s2GmOffset++) {
             DataCopyPad(kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 + 512 * constInfo.headDim +
                                    s2GmOffset * constInfo.headDimRope],
                         kvMergUb_, dataCopyParams);
-            // [step 4b] 同步写到 packed_key_rope
-            if (constInfo.returnPackedKv) {
-                DataCopyPad(packedKeyRopeGm_[packedRopeBase + s2GmOffset * constInfo.headDimRope],
-                            kvMergUb_, dataCopyParams);
-            }
         }
         SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx & 1);
         mergeMte3Idx++;

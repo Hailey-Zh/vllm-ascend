@@ -48,7 +48,6 @@ constexpr uint32_t OUTPUT_INDEX_1 = 1;  // softmax_max
 constexpr uint32_t OUTPUT_INDEX_2 = 2;  // softmax_sum
 constexpr uint32_t OUTPUT_INDEX_3 = 3;  // [step 4] packed_key
 constexpr uint32_t OUTPUT_INDEX_4 = 4;  // [step 4] packed_key_rope
-constexpr uint32_t OUTPUT_INDEX_5 = 5;  // [step 4] actual_packed_len
 
 ge::graphStatus InferShapeSparseFlashAttention(gert::InferShapeContext *context)
 {
@@ -112,12 +111,11 @@ ge::graphStatus InferShapeSparseFlashAttention(gert::InferShapeContext *context)
         softmaxSumShape->SetDim(DIM_INDEX_3, g);
     }
 
-    // [step 4] packed_key / packed_key_rope / actual_packed_len。
+    // [step 4] packed_key / packed_key_rope（len 不输出，框架自算）。
     // OPTIONAL 输出：return_packed_kv=false 时调用方传 nullopt，GetOutputShape 返回 nullptr → 跳过。
     gert::Shape *packedKeyShape = context->GetOutputShape(OUTPUT_INDEX_3);
     gert::Shape *packedKeyRopeShape = context->GetOutputShape(OUTPUT_INDEX_4);
-    gert::Shape *actualPackedLenShape = context->GetOutputShape(OUTPUT_INDEX_5);
-    if (packedKeyShape != nullptr && packedKeyRopeShape != nullptr && actualPackedLenShape != nullptr) {
+    if (packedKeyShape != nullptr && packedKeyRopeShape != nullptr) {
         const gert::Shape *sparseIndicesShape = context->GetInputShape(SPARSE_INDICES_INPUT_INDEX);
         OPS_LOG_E_IF_NULL(context, sparseIndicesShape, return ge::GRAPH_FAILED)
         const int64_t *sparseBlockSizePtr = attrs->GetAttrPointer<int64_t>(SPARSE_BLOCK_SIZE_ATTR_INDEX);
@@ -134,7 +132,7 @@ ge::graphStatus InferShapeSparseFlashAttention(gert::InferShapeContext *context)
         }
 
         if (queryShape->GetDimNum() == DIM_NUM_3) {
-            // TND: packed_key [T1, N2, S2, headDim]，actual_packed_len [T1, N2]
+            // TND: packed_key [T1, N2, S2, headDim]
             int64_t n2 = (layoutKvStr == "PA_BSND") ? keyShape->GetDim(DIM_INDEX_2)
                                                     : keyShape->GetDim(DIM_INDEX_1);
             int64_t t1 = queryShape->GetDim(DIM_INDEX_0);
@@ -150,12 +148,8 @@ ge::graphStatus InferShapeSparseFlashAttention(gert::InferShapeContext *context)
             packedKeyRopeShape->SetDim(DIM_INDEX_1, n2);
             packedKeyRopeShape->SetDim(DIM_INDEX_2, s2);
             packedKeyRopeShape->SetDim(DIM_INDEX_3, ropeDim);
-
-            actualPackedLenShape->SetDimNum(DIM_NUM_2);
-            actualPackedLenShape->SetDim(DIM_INDEX_0, t1);
-            actualPackedLenShape->SetDim(DIM_INDEX_1, n2);
         } else {
-            // BSND: packed_key [B, S1, N2, S2, headDim]，actual_packed_len [B, S1, N2]
+            // BSND: packed_key [B, S1, N2, S2, headDim]
             int64_t b = queryShape->GetDim(DIM_INDEX_0);
             int64_t s1 = queryShape->GetDim(DIM_INDEX_1);
             int64_t n2 = keyShape->GetDim(DIM_INDEX_2);
@@ -173,11 +167,6 @@ ge::graphStatus InferShapeSparseFlashAttention(gert::InferShapeContext *context)
             packedKeyRopeShape->SetDim(DIM_INDEX_2, n2);
             packedKeyRopeShape->SetDim(DIM_INDEX_3, s2);
             packedKeyRopeShape->SetDim(DIM_INDEX_4, ropeDim);
-
-            actualPackedLenShape->SetDimNum(DIM_NUM_3);
-            actualPackedLenShape->SetDim(DIM_INDEX_0, b);
-            actualPackedLenShape->SetDim(DIM_INDEX_1, s1);
-            actualPackedLenShape->SetDim(DIM_INDEX_2, n2);
         }
     }
     return GRAPH_SUCCESS;
@@ -191,10 +180,9 @@ ge::graphStatus InferDataTypeSparseFlashAttention(gert::InferDataTypeContext *co
     context->SetOutputDataType(OUTPUT_INDEX_0, inputDataType);
     context->SetOutputDataType(OUTPUT_INDEX_1, ge::DT_FLOAT);
     context->SetOutputDataType(OUTPUT_INDEX_2, ge::DT_FLOAT);
-    // [step 4] packed_key / packed_key_rope 与 query 同 dtype；actual_packed_len = int32
+    // [step 4] packed_key / packed_key_rope 与 query 同 dtype（len 不输出）
     context->SetOutputDataType(OUTPUT_INDEX_3, inputDataType);
     context->SetOutputDataType(OUTPUT_INDEX_4, inputDataType);
-    context->SetOutputDataType(OUTPUT_INDEX_5, ge::DT_INT32);
     return ge::GRAPH_SUCCESS;
 }
 

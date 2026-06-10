@@ -84,14 +84,10 @@ public:
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
         // packed_key_rope = 选中 token 的 RoPE-K，与 query 同 dtype。
+        // 注：actual_packed_len 不由算子输出，框架用 sparse_indices + causal 自算。
         this->Output("packed_key_rope")
             .ParamType(OPTIONAL)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
-            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-        // actual_packed_len = 每个 (b,s1,n2) 段有效 token 数。
-        this->Output("actual_packed_len")
-            .ParamType(OPTIONAL)
-            .DataType({ge::DT_INT32, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Attr("scale_value").AttrType(REQUIRED).Float(1.0);
         this->Attr("sparse_block_size").AttrType(REQUIRED).Int(1);

@@ -18,7 +18,7 @@
 namespace vllm_ascend {
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor,
-           c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>>
+           c10::optional<at::Tensor>, c10::optional<at::Tensor>>
 npu_sparse_flash_attention(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const c10::optional<at::Tensor> &sparse_indices, double scale_value, int64_t sparse_block_size,
@@ -120,9 +120,9 @@ npu_sparse_flash_attention(
     }
 
     // [step 4] packed KV 输出。OPTIONAL：return_packed_kv=false 时传 nullopt、不分配显存。
+    // actual_packed_len 不由算子输出，框架用 sparse_indices + causal 自算。
     c10::optional<at::Tensor> packed_key;
     c10::optional<at::Tensor> packed_key_rope;
-    c10::optional<at::Tensor> actual_packed_len;
     if (return_packed_kv) {
         // 仅支持稀疏 + sparseBlockSize<=4（MergeKv 硬约束，tiling 侧也会校验）
         TORCH_CHECK(sparse_indices.has_value(),
@@ -137,23 +137,20 @@ npu_sparse_flash_attention(
         int64_t head_dim = key.size(-1);
         int64_t rope_dim = key_rope.has_value() ? key_rope.value().size(-1) : 64;
 
-        std::vector<int64_t> pk_shape, pkr_shape, len_shape;
+        std::vector<int64_t> pk_shape, pkr_shape;
         if (layout_query_str == "TND") {
             int64_t t1 = query.size(0);
             pk_shape  = {t1, n2, s2, head_dim};
             pkr_shape = {t1, n2, s2, rope_dim};
-            len_shape = {t1, n2};
         } else {  // BSND
             int64_t b = query.size(0);
             int64_t s1 = query.size(1);
             pk_shape  = {b, s1, n2, s2, head_dim};
             pkr_shape = {b, s1, n2, s2, rope_dim};
-            len_shape = {b, s1, n2};
         }
-        // padding/尾部清零由 kernel 负责，host 端 at::empty 不必清。
+        // 有效区由 kernel 写，尾部/len 交给框架（下游按自算的 len 切片读）。
         packed_key       = at::empty(pk_shape,  query.options().dtype(query.dtype()));
         packed_key_rope  = at::empty(pkr_shape, query.options().dtype(query.dtype()));
-        actual_packed_len = at::empty(len_shape, query.options().dtype(at::kInt));
     }
 
     EXEC_NPU_CMD(
@@ -178,10 +175,8 @@ npu_sparse_flash_attention(
         softmax_max,
         softmax_sum,
         packed_key,
-        packed_key_rope,
-        actual_packed_len);
-    return std::make_tuple(output, softmax_max, softmax_sum,
-                           packed_key, packed_key_rope, actual_packed_len);
+        packed_key_rope);
+    return std::make_tuple(output, softmax_max, softmax_sum, packed_key, packed_key_rope);
 }
 }
 #endif
