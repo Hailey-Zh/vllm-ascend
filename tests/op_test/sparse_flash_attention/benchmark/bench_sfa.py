@@ -77,6 +77,13 @@ def _build_grid():
     grid.append(("dense_decode_B1_S2-4096", "dense", "TND", "PA_BSND", fp16, 1, 1, 4096, 16, 0))
     grid.append(("dense_decode_B8_S2-4096", "dense", "TND", "PA_BSND", fp16, 8, 1, 4096, 16, 0))
 
+    # --- large-batch decode sweep (throughput): when does the device fill up? ---
+    #   sparse stays overhead-bound at small B (~flat), starts scaling once the
+    #   cores are saturated; dense (more work/token) scales with B earlier.
+    for B in (16, 32, 64):
+        grid.append((f"basic_decode_B{B}_S2{4096}", "basic", "TND", "PA_BSND", fp16, B, 1, 4096, 16, 2048))
+        grid.append((f"dense_decode_B{B}_S2-4096", "dense", "TND", "PA_BSND", fp16, B, 1, 4096, 16, 0))
+
     # --- prefill (large S1) ---
     prefill_shapes = [
         # (B, S1, S2, N1, K)
@@ -98,6 +105,18 @@ def _build_grid():
     grid.append(("lse_decode_bf16_B8", "lse", "TND", "PA_BSND", bf16, 8, 1, 4096, 16, 2048))
     grid.append(("dense_decode_bf16_B8", "dense", "TND", "PA_BSND", bf16, 8, 1, 4096, 16, 0))
     grid.append(("packed_decode_bf16_B8", "packed", "BSND", "BSND", bf16, 8, 1, 2048, 16, 256))
+
+    # --- equal-compute (eqc) matched pairs: isolate PATH overhead, not work amount ---
+    # Group A — dense vs sparse, both compute exactly 2048 KV tokens, same layout/S2.
+    #   Any time difference = pure gather (sparse) vs contiguous (dense) path cost.
+    #   Prefill (compute-bound) so the difference is interpretable.
+    grid.append(("eqc_dense_prefill_2048", "dense", "BSND", "BSND", fp16, 1, 512, 2048, 16, 0))
+    grid.append(("eqc_sparse_prefill_2048", "basic", "BSND", "BSND", fp16, 1, 512, 2048, 16, 2048))
+    # Group B — packed vs basic, identical shape, only return_packed_kv differs.
+    #   Any time difference = pure copy-out overhead of packed_kv. Decode = packed's
+    #   real use case (small K keeps the packed output small).
+    grid.append(("eqc_basic_decode_K256", "basic", "BSND", "BSND", fp16, 1, 1, 2048, 16, 256))
+    grid.append(("eqc_packed_decode_K256", "packed", "BSND", "BSND", fp16, 1, 1, 2048, 16, 256))
 
     return grid
 

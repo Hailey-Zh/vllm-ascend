@@ -193,6 +193,15 @@ python bench_sfa.py --csv ./my_run.csv       # 指定 CSV 输出路径
 > `(name, feature, layout_q, layout_kv, dtype, B, S1, S2, N1, K)`，`feature ∈ {basic,lse,dense,packed}`。
 > 某个 shape 跑挂不会中断整轮，会在该行标 `ERROR` 继续跑下一个。
 
+shape 表里有三组值得单独看：
+
+- **大 batch decode sweep**（`basic_decode_B16/32/64`、`dense_decode_B16/32/64`）：decode 在小 batch
+  是开销受限（B1~B8 时延几乎不变），加大 B 看算力何时被填满、时延何时开始随 batch 线性涨。
+- **等算量对照 A**（`eqc_dense_prefill_2048` vs `eqc_sparse_prefill_2048`）：两者都算 **2048 个 KV
+  token**、同 layout/S2，时延差 = 稀疏 gather vs 稠密连续读的**纯路径开销**（剔除"算多少"的影响）。
+- **等算量对照 B**（`eqc_basic_decode_K256` vs `eqc_packed_decode_K256`）：完全同 shape，只差
+  `return_packed_kv`，时延差 = packed_kv 的 **copy-out 纯开销**。
+
 ---
 
 ## 关键概念速查
