@@ -291,6 +291,47 @@ def test_vtemplate_ignores_indices():
     print(f"[uses-indices]  vs golden_prefix(value[0])    = {d_pref:.6e}  (≈0 则 V 取了前缀 token0)")
 
 
+def test_vtemplate_token_id_probe():
+    # 探针：value[b,j,0,:] = 标量 j。则 out = Σ_j w_j * j = V 实际 attend 的 token 重心。
+    # 单 token 选择时 softmax 权重=1，out 应精确等于被选 token 的 id。直接读出 V 取了哪些 token。
+    torch.manual_seed(42)
+    B, S1, S2, N1, N2, D, ROPE = 2, 4, 128, 8, 1, 512, 64
+    device = "npu"
+    dtype = torch.float16
+    query = (torch.randn(B, S1, N1, D, dtype=dtype, device=device) * 0.1)
+    key = (torch.randn(B, S2, N2, D, dtype=dtype, device=device) * 0.1)
+    query_rope = (torch.randn(B, S1, N1, ROPE, dtype=dtype, device=device) * 0.1)
+    key_rope = (torch.randn(B, S2, N2, ROPE, dtype=dtype, device=device) * 0.1)
+    # value[b,j,0,:] = j
+    ids = torch.arange(S2, dtype=dtype, device=device).view(1, S2, 1, 1)
+    value = ids.expand(B, S2, N2, D).contiguous()
+    actual_seq_q = torch.tensor([S1, S1], dtype=torch.int32, device=device)
+    actual_seq_kv = torch.tensor([S2, S2], dtype=torch.int32, device=device)
+
+    def run(idx_list):
+        K = len(idx_list)
+        idx = (torch.tensor(idx_list, dtype=torch.int32, device=device)
+               .view(1, 1, 1, K).expand(B, S1, N2, K).contiguous())
+        out = _call_op(
+            query=query, key=key, value=value, sparse_indices=idx, sparse_block_size=1,
+            block_table=None, actual_seq_q=actual_seq_q, actual_seq_kv=actual_seq_kv,
+            query_rope=query_rope, key_rope=key_rope, layout_query="BSND", layout_kv="BSND",
+        )[0].float().cpu()
+        torch.npu.synchronize()
+        return out
+
+    print("\n[probe] value[j]=j，out=被 attend token 的加权重心：")
+    for idx_list, note in [
+        ([0], "单选 token0 -> 期望 out≈0"),
+        ([64], "单选 token64 -> 期望 out≈64"),
+        ([127], "单选 token127 -> 期望 out≈127"),
+        ([10, 20], "选 {10,20} -> 期望 out∈[10,20]"),
+        (list(range(128)), "全选 -> 期望 out 为某加权均值"),
+    ]:
+        out = run(idx_list)
+        print(f"[probe] idx={str(idx_list)[:24]:24s} mean={out.mean():.3f} min={out.min():.3f} max={out.max():.3f}  ({note})")
+
+
 def test_ctemplate_mm2_constant_value():
     # mm2 / softmax 归一化隔离：把所有 V 行设成 per-batch 常量 v0。
     # 任意正确的 attention 都应输出 out == v0（softmax 权重和为 1，与 QK 分数无关）。
