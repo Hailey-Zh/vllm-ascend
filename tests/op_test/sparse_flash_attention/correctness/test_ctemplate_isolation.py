@@ -143,3 +143,44 @@ def test_ctemplate_base_matches_vtemplate():
     # 失败 => 锅在 C_TEMPLATE 公共路径，不在 isDense 分支。
     assert torch.allclose(b, a, rtol=1e-3, atol=1e-3), \
         f"C_TEMPLATE base path diverges from V_TEMPLATE: max_abs_diff={diff_ba:.6e}"
+
+
+def test_ctemplate_mm2_constant_value():
+    # mm2 / softmax 归一化隔离：把所有 V 行设成 per-batch 常量 v0。
+    # 任意正确的 attention 都应输出 out == v0（softmax 权重和为 1，与 QK 分数无关）。
+    #   - C_TEMPLATE 返回 v0  => V 读取 + softmax 归一化正确 => 锅在 mm1（K/rope/scale）。
+    #   - C_TEMPLATE != v0    => 锅在 mm2（V 读取）或 softmax 归一化。
+    # block_size=8 -> C_TEMPLATE，isDenseMode=false；与 dummy 无关，无需 rebuild。
+    torch.manual_seed(7)
+    B, S1, S2, N1, N2, D, ROPE = 2, 4, 128, 8, 1, 512, 64
+    device = "npu"
+    dtype = torch.float16
+
+    query = (torch.randn(B, S1, N1, D, dtype=dtype, device=device) * 0.1)
+    key = (torch.randn(B, S2, N2, D, dtype=dtype, device=device) * 0.1)
+    query_rope = (torch.randn(B, S1, N1, ROPE, dtype=dtype, device=device) * 0.1)
+    key_rope = (torch.randn(B, S2, N2, ROPE, dtype=dtype, device=device) * 0.1)
+
+    # 每个 batch 一个常量行 v0[b]，沿 S2 广播 => value[b, :, 0, :] 全等于 v0[b]
+    v0 = (torch.randn(B, N2, D, dtype=dtype, device=device) * 0.1)
+    value = v0.view(B, 1, N2, D).expand(B, S2, N2, D).contiguous()
+
+    actual_seq_q = torch.tensor([S1, S1], dtype=torch.int32, device=device)
+    actual_seq_kv = torch.tensor([S2, S2], dtype=torch.int32, device=device)
+
+    assert S2 % 8 == 0
+    idx_bs8 = _full_indices(B, S1, N2, S2 // 8, device)
+    out = _call_op(
+        query=query, key=key, value=value, sparse_indices=idx_bs8, sparse_block_size=8,
+        block_table=None, actual_seq_q=actual_seq_q, actual_seq_kv=actual_seq_kv,
+        query_rope=query_rope, key_rope=key_rope, layout_query="BSND", layout_kv="BSND",
+    )[0]
+    torch.npu.synchronize()
+
+    out_cpu = out.float().cpu()
+    # 期望：out[b, s1, n1, :] == v0[b, 0, :]（N2=1，GQA 下所有 query head 共享同一 KV head）
+    expected = v0.float().cpu().view(B, 1, 1, D).expand(B, S1, N1, D)
+    max_abs = (out_cpu - expected).abs().max().item()
+    print(f"[mm2-isolation] max_abs_diff(C_TEMPLATE bs=8, constant-V golden) = {max_abs:.6e}")
+    assert torch.allclose(out_cpu, expected, rtol=1e-3, atol=1e-3), \
+        f"C_TEMPLATE mm2/softmax wrong: out != constant V, max_abs_diff={max_abs:.6e}"
