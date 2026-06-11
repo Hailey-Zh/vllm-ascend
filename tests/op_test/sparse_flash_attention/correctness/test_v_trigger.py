@@ -71,8 +71,9 @@ def test_v_trigger_bisect():
     def run_v(indices_1d, K_slots):
         """V_TEMPLATE: bs=1, indices 含末尾 -1 哨兵（K_slots > len）。"""
         t = torch.full((B, S1, N2, K_slots), -1, dtype=torch.int32, device=device)
-        for i, v in enumerate(indices_1d):
-            t[:, :, :, i] = v
+        n_fill = min(len(indices_1d), K_slots)
+        for i in range(n_fill):
+            t[:, :, :, i] = indices_1d[i]
         return _call_op(sparse_indices=t, sparse_block_size=1, **common)[0].float().cpu()
 
     def run_c_ref(K):
