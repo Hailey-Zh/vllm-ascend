@@ -145,6 +145,64 @@ def test_ctemplate_base_matches_vtemplate():
         f"C_TEMPLATE base path diverges from V_TEMPLATE: max_abs_diff={diff_ba:.6e}"
 
 
+def _cpu_mla_dense_golden(query, key, value, query_rope, key_rope, scale):
+    # BSND, GQA(N2=1). 标准 dense attention 的 CPU 参考（fp32 累加）。
+    # score[b,s1,h,s2] = (q.k_nope + qr.kr_rope)*scale；softmax over s2；out = P @ V。
+    q = query.float().cpu()        # [B,S1,N1,D]
+    k = key.float().cpu()          # [B,S2,N2,D]
+    v = value.float().cpu()        # [B,S2,N2,D]
+    qr = query_rope.float().cpu()  # [B,S1,N1,R]
+    kr = key_rope.float().cpu()    # [B,S2,N2,R]
+    B, S1, N1, D = q.shape
+    S2 = k.shape[1]
+    k0 = k[:, :, 0, :]             # [B,S2,D]   (N2=1，所有 query head 共享)
+    v0 = v[:, :, 0, :]             # [B,S2,D]
+    kr0 = kr[:, :, 0, :]           # [B,S2,R]
+    out = torch.empty(B, S1, N1, D, dtype=torch.float32)
+    for b in range(B):
+        for h in range(N1):
+            s_nope = q[b, :, h, :] @ k0[b].transpose(0, 1)    # [S1,S2]
+            s_rope = qr[b, :, h, :] @ kr0[b].transpose(0, 1)  # [S1,S2]
+            score = (s_nope + s_rope) * scale
+            p = torch.softmax(score, dim=-1)                  # [S1,S2]
+            out[b, :, h, :] = p @ v0[b]                       # [S1,D]
+    return out
+
+
+def test_ctemplate_vs_cpu_golden():
+    # 不依赖 V_TEMPLATE 的铁证：block_size=8 (C_TEMPLATE) 直接对 CPU dense golden。
+    # 同时报告 block_size=1 (V_TEMPLATE) 对 golden，作为"CPU 参考可信"的 sanity。
+    case = _make_bsnd_case()
+    common = {k: case[k] for k in (
+        "query", "key", "value", "block_table",
+        "actual_seq_q", "actual_seq_kv",
+        "query_rope", "key_rope", "layout_query", "layout_kv")}
+    B, S1, S2, N2 = case["B"], case["S1"], case["S2"], case["N2"]
+    device = "npu"
+
+    golden = _cpu_mla_dense_golden(
+        case["query"], case["key"], case["value"],
+        case["query_rope"], case["key_rope"], SCALE)
+
+    idx_bs1 = _full_indices(B, S1, N2, S2, device)
+    out_v = _call_op(sparse_indices=idx_bs1, sparse_block_size=1, **common)[0].float().cpu()
+    torch.npu.synchronize()
+
+    idx_bs8 = _full_indices(B, S1, N2, S2 // 8, device)
+    out_c = _call_op(sparse_indices=idx_bs8, sparse_block_size=8, **common)[0].float().cpu()
+    torch.npu.synchronize()
+
+    diff_v = (out_v - golden).abs().max().item()
+    diff_c = (out_c - golden).abs().max().item()
+    print(f"[golden] max_abs_diff(V_TEMPLATE bs=1, CPU golden) = {diff_v:.6e}")
+    print(f"[golden] max_abs_diff(C_TEMPLATE bs=8, CPU golden) = {diff_c:.6e}")
+
+    # sanity：V_TEMPLATE 应当接近 golden（证明 CPU 参考可信）。fp16 kernel，放宽到 3e-3。
+    assert diff_v < 3e-3, f"CPU golden 与已验证的 V_TEMPLATE 都对不上，参考实现可疑: {diff_v:.6e}"
+    # 主断言：C_TEMPLATE 直接对解析 golden。失败 => C_TEMPLATE 本身错，与对拍对象无关。
+    assert diff_c < 3e-3, f"C_TEMPLATE 对 CPU golden 偏离: {diff_c:.6e}"
+
+
 def test_ctemplate_mm2_constant_value():
     # mm2 / softmax 归一化隔离：把所有 V 行设成 per-batch 常量 v0。
     # 任意正确的 attention 都应输出 out == v0（softmax 权重和为 1，与 QK 分数无关）。
