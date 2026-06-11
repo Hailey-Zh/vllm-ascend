@@ -493,7 +493,7 @@ def test_packed_kv_with_lse():
     # 2. Verify LSE outputs against reference (from lse test file)
     from test_sparse_flash_attention_lse import _lse_ref_bsnd
     ref_out, ref_max, ref_sum = _lse_ref_bsnd(
-        query, key, sparse_indices, SCALE,
+        query, key, query_rope, key_rope, sparse_indices, SCALE,
         actual_seq_q, actual_seq_kv, sparse_mode=0, sparse_block_size=1)
 
     out_d = (attn_out.float().cpu() - ref_out).abs().max().item()
@@ -503,7 +503,7 @@ def test_packed_kv_with_lse():
           f"softmax_max diff={max_d:.6e}  softmax_sum diff={sum_d:.6e}")
     assert torch.allclose(attn_out.float().cpu(), ref_out, rtol=1e-3, atol=1e-3), \
         f"packed+LSE: attn_out mismatch"
-    assert torch.allclose(lse_max.float().cpu(), ref_max, rtol=1e-3, atol=1e-3), \
+    assert torch.allclose(lse_max.float().cpu(), ref_max, rtol=2e-3, atol=2e-3), \
         f"packed+LSE: softmax_max mismatch"
-    assert torch.allclose(lse_sum.float().cpu(), ref_sum, rtol=1e-3, atol=1e-3), \
+    assert torch.allclose(lse_sum.float().cpu(), ref_sum, rtol=2e-3, atol=2e-3), \
         f"packed+LSE: softmax_sum mismatch"

@@ -198,10 +198,14 @@ def test_dense_matches_sparse_full_tnd_pa_bsnd():
 # Dense + LSE combined (BSND/BSND)
 # ---------------------------------------------------------------------------
 
-def _dense_lse_ref_bsnd(query, key, scale, actual_seq_q, actual_seq_kv):
+def _dense_lse_ref_bsnd(query, key, query_rope, key_rope, scale,
+                        actual_seq_q, actual_seq_kv):
     """Reference dense attention with LSE for BSND layout.
 
-    query: [B, S1, N1, D]     key: [B, S2, N2, D]
+    MLA score uses full 576-dim = NoPE(D) concat RoPE; value = NoPE only.
+
+    query:      [B, S1, N1, D]     key:      [B, S2, N2, D]
+    query_rope: [B, S1, N1, ROPE]  key_rope: [B, S2, N2, ROPE]
     Returns (attn_out, softmax_max, softmax_sum) — all fp32 on cpu.
       attn_out:    [B, S1, N1, D]
       softmax_max: [B, N2, S1, g]   g = N1/N2
@@ -213,6 +217,8 @@ def _dense_lse_ref_bsnd(query, key, scale, actual_seq_q, actual_seq_kv):
 
     q = query.float().cpu()
     k = key.float().cpu()
+    qr = query_rope.float().cpu()
+    kr = key_rope.float().cpu()
     aq = actual_seq_q.cpu()
     akv = actual_seq_kv.cpu()
 
@@ -227,12 +233,15 @@ def _dense_lse_ref_bsnd(query, key, scale, actual_seq_q, actual_seq_kv):
             for n2 in range(N2):
                 qh = q[b, s1, n2 * g:(n2 + 1) * g, :]           # [g, D]
                 kh = k[b, :act_kv, n2, :]                         # [act_kv, D]
-                scores = torch.matmul(qh, kh.T) * scale            # [g, act_kv]
+                qh_full = torch.cat(
+                    [qh, qr[b, s1, n2 * g:(n2 + 1) * g, :]], dim=-1)
+                kh_full = torch.cat([kh, kr[b, :act_kv, n2, :]], dim=-1)
+                scores = torch.matmul(qh_full, kh_full.T) * scale  # [g, act_kv]
                 smax = scores.max(dim=-1).values                  # [g]
                 ssub = scores - smax.unsqueeze(-1)
                 sexp_sum = ssub.exp().sum(dim=-1)                 # [g]
                 attn_w = (ssub.exp() / sexp_sum.unsqueeze(-1)).half()
-                attn_o = torch.matmul(attn_w.float(), kh)          # [g, D]
+                attn_o = torch.matmul(attn_w.float(), kh)          # [g, D] NoPE
                 out[b, s1, n2 * g:(n2 + 1) * g, :] = attn_o
                 lse_max[b, n2, s1, :] = smax
                 lse_sum[b, n2, s1, :] = sexp_sum
@@ -272,7 +281,7 @@ def test_dense_lse_bsnd_bsnd():
     attn_out, lse_max, lse_sum, _, _ = output
 
     ref_out, ref_max, ref_sum = _dense_lse_ref_bsnd(
-        query, key, SCALE, actual_seq_q, actual_seq_kv)
+        query, key, query_rope, key_rope, SCALE, actual_seq_q, actual_seq_kv)
 
     # attn_out: fp16 output, standard tolerance
     out_diff = (attn_out.float().cpu() - ref_out).abs().max().item()
