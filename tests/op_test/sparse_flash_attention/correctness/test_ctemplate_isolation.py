@@ -371,3 +371,51 @@ def test_ctemplate_mm2_constant_value():
     print(f"[mm2-isolation] max_abs_diff(C_TEMPLATE bs=8, constant-V golden) = {max_abs:.6e}")
     assert torch.allclose(out_cpu, expected, rtol=1e-3, atol=1e-3), \
         f"C_TEMPLATE mm2/softmax wrong: out != constant V, max_abs_diff={max_abs:.6e}"
+
+
+def test_key_equals_value():
+    """key==value 时 C_TEMPLATE 和 V_TEMPLATE 都应该接近 CPU golden。
+    验证框架 single 用例的设计不是巧合：当 K==V 时 V_TEMPLATE 的"读 K 当 V"bug 被掩盖。"""
+    torch.manual_seed(42)
+    B, S1, S2, N1, N2, D, ROPE = 2, 4, 128, 8, 1, 512, 64
+    device = "npu"
+    dtype = torch.float16
+
+    query = (torch.randn(B, S1, N1, D, dtype=dtype, device=device) * 0.1)
+    kv = (torch.randn(B, S2, N2, D, dtype=dtype, device=device) * 0.1)  # key==value
+    query_rope = (torch.randn(B, S1, N1, ROPE, dtype=dtype, device=device) * 0.1)
+    kv_rope = (torch.randn(B, S2, N2, ROPE, dtype=dtype, device=device) * 0.1)  # key_rope==? 无关，保持独立
+    actual_seq_q = torch.tensor([S1, S1], dtype=torch.int32, device=device)
+    actual_seq_kv = torch.tensor([S2, S2], dtype=torch.int32, device=device)
+
+    common = dict(query=query, key=kv, value=kv,
+                  block_table=None, actual_seq_q=actual_seq_q, actual_seq_kv=actual_seq_kv,
+                  query_rope=query_rope, key_rope=kv_rope,
+                  layout_query="BSND", layout_kv="BSND")
+
+    # CPU golden（key==value）
+    golden = _cpu_mla_dense_golden(query, kv, kv, query_rope, kv_rope, SCALE)
+
+    # V_TEMPLATE: bs=1 全选
+    idx1 = _full_indices(B, S1, N2, S2, device)
+    out_v = _call_op(sparse_indices=idx1, sparse_block_size=1, **common)[0].float().cpu()
+    torch.npu.synchronize()
+
+    # C_TEMPLATE: bs=8 全选
+    idx8 = _full_indices(B, S1, N2, S2 // 8, device)
+    out_c = _call_op(sparse_indices=idx8, sparse_block_size=8, **common)[0].float().cpu()
+    torch.npu.synchronize()
+
+    dv = (out_v - golden).abs().max().item()
+    dc = (out_c - golden).abs().max().item()
+    dvc = (out_v - out_c).abs().max().item()
+    print(f"[key==value] V_TEMPLATE vs CPU golden = {dv:.6e}")
+    print(f"[key==value] C_TEMPLATE vs CPU golden = {dc:.6e}")
+    print(f"[key==value] V_TEMPLATE vs C_TEMPLATE  = {dvc:.6e}")
+
+    assert torch.allclose(out_v, golden, rtol=1e-3, atol=1e-3), \
+        f"key==value: V_TEMPLATE wrong vs CPU golden, diff={dv:.6e}"
+    assert torch.allclose(out_c, golden, rtol=1e-3, atol=1e-3), \
+        f"key==value: C_TEMPLATE wrong vs CPU golden, diff={dc:.6e}"
+    assert torch.allclose(out_v, out_c, rtol=1e-3, atol=1e-3), \
+        f"key==value: V vs C mismatch, diff={dvc:.6e}"
