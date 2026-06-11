@@ -22,7 +22,7 @@
 # cases -> the downstream reads [0, len); validated framework-side.)
 #
 # Run manually (must source set_env.bash first):
-#   pytest test_sparse_flash_attention_packed_kv.py -m step4_packed_kv -s -v
+#   pytest test_packed_kv.py -m step4_packed_kv -s -v
 
 import pytest
 import torch

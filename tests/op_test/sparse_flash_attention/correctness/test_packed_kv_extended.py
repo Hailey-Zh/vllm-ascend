@@ -20,7 +20,7 @@
 #   - packed_kv + LSE combined
 #
 # Run manually (must source set_env.bash first):
-#   pytest test_sparse_flash_attention_packed_kv_extended.py -m packed_ext -s -v
+#   pytest test_packed_kv_extended.py -m packed_ext -s -v
 
 import math
 
@@ -493,7 +493,7 @@ def test_packed_kv_with_lse():
         f"packed+LSE: packed_key_rope mismatch max={max_r:.3e}"
 
     # 2. Verify LSE outputs against reference (from lse test file)
-    from test_sparse_flash_attention_lse import _lse_ref_bsnd
+    from test_lse import _lse_ref_bsnd
     ref_out, ref_max, ref_sum = _lse_ref_bsnd(
         query, key, query_rope, key_rope, sparse_indices, SCALE,
         actual_seq_q, actual_seq_kv, sparse_mode=0, sparse_block_size=1)

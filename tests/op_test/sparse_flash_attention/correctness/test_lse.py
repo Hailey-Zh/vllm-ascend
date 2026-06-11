@@ -17,7 +17,7 @@
 # reference that replicates the kernel's sparse-selection + softmax logic.
 #
 # Run manually (must source set_env.bash first):
-#   pytest test_sparse_flash_attention_lse.py -m lse -s -v
+#   pytest test_lse.py -m lse -s -v
 
 import math
 

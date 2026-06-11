@@ -18,7 +18,7 @@
 #   - Dense + LSE combined (BSND/BSND)
 #
 # Run manually (must source set_env.bash first):
-#   pytest test_sparse_flash_attention_dense_extended.py -m dense_ext -s -v
+#   pytest test_dense_extended.py -m dense_ext -s -v
 
 import math
 

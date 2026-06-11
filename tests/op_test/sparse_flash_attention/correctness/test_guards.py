@@ -18,7 +18,7 @@
 # Plus the sparse_block_size=4 boundary, which must run and gather correctly.
 #
 # Run manually (must source set_env.bash first):
-#   pytest test_sparse_flash_attention_guards.py -m guards -s -v
+#   pytest test_guards.py -m guards -s -v
 
 import pytest
 import torch

@@ -22,7 +22,7 @@
 #   - BSND / PA_BSND     : exercises DataCopyPA with isDense
 #
 # Run manually:
-#   pytest test_sparse_flash_attention_dense_correctness.py -m step3c_dense -s -v
+#   pytest test_dense.py -m step3c_dense -s -v
 
 import pytest
 import torch
