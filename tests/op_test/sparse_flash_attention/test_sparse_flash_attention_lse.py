@@ -619,3 +619,59 @@ def test_lse_varying_actual_seq():
     _assert_close(attn_out, ref_out, "attn_out var-act-seq")
     _assert_lse_close(lse_max, ref_max, "softmax_max var-act-seq")
     _assert_lse_close(lse_sum, ref_sum, "softmax_sum var-act-seq")
+
+
+# ---------------------------------------------------------------------------
+# dtype coverage: bf16 LSE (different rounding path from fp16)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.lse
+def test_lse_bsnd_bsnd_bf16():
+    """LSE for BSND/BSND, sparse_mode=0, bf16.
+
+    bf16 has ~3 fewer mantissa bits than fp16; LSE (fp32 output computed from
+    bf16 inputs) accumulates more rounding, so use a wider 1e-2 tolerance.
+    """
+    torch.manual_seed(107)
+    B, S1, S2, N1, N2, D, ROPE, K = 2, 4, 128, 8, 1, 512, 64, 8
+    device, dtype = "npu", torch.bfloat16
+
+    query = torch.randn(B, S1, N1, D, dtype=dtype, device=device) * 0.1
+    key = torch.randn(B, S2, N2, D, dtype=dtype, device=device) * 0.1
+    value = key
+    query_rope = torch.randn(B, S1, N1, ROPE, dtype=dtype, device=device) * 0.1
+    key_rope = torch.randn(B, S2, N2, ROPE, dtype=dtype, device=device) * 0.1
+    actual_seq_q = torch.tensor([S1] * B, dtype=torch.int32, device=device)
+    actual_seq_kv = torch.tensor([S2] * B, dtype=torch.int32, device=device)
+
+    sel = torch.empty(B, S1, N2, K, dtype=torch.int32)
+    for b in range(B):
+        for s1 in range(S1):
+            for n2 in range(N2):
+                sel[b, s1, n2] = torch.randperm(S2)[:K].to(torch.int32)
+    sparse_indices = sel.to(device)
+
+    output = torch.ops._C_ascend.npu_sparse_flash_attention(
+        query=query, key=key, value=value,
+        sparse_indices=sparse_indices,
+        scale_value=SCALE, sparse_block_size=1,
+        block_table=None,
+        actual_seq_lengths_query=actual_seq_q,
+        actual_seq_lengths_kv=actual_seq_kv,
+        query_rope=query_rope, key_rope=key_rope,
+        layout_query="BSND", layout_kv="BSND",
+        sparse_mode=0,
+        return_softmax_lse=True,
+        return_packed_kv=False,
+    )
+    torch.npu.synchronize()
+    attn_out, lse_max, lse_sum, _, _ = output
+
+    ref_out, ref_max, ref_sum = _lse_ref_bsnd(
+        query, key, query_rope, key_rope, sparse_indices, SCALE,
+        actual_seq_q, actual_seq_kv, sparse_mode=0, sparse_block_size=1)
+
+    # bf16: wider tolerance for both attn_out and LSE
+    _assert_close(attn_out, ref_out, "attn_out BSND/BSND bf16", rtol=1e-2, atol=1e-2)
+    _assert_close(lse_max, ref_max, "softmax_max BSND/BSND bf16", rtol=1e-2, atol=1e-2)
+    _assert_close(lse_sum, ref_sum, "softmax_sum BSND/BSND bf16", rtol=1e-2, atol=1e-2)
