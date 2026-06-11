@@ -128,13 +128,37 @@ TEST_PARAMS = {
         "actual_seq_q": [[2, 6, 11, 15]],
         "actual_seq_kv": [[1024, 1024, 1024, 1024]],
     },
+    # LSE 回归用例：BSND/BSND + fp16 + return_softmax_lse=True
+    "bsnd_lse": {
+        "Testcase_Prefix": ["sfa_bsnd_lse"],
+        "layout_query": ["BSND"],
+        "layout_kv": ["BSND"],
+        "q_type": [torch.float16],
+        "kv_type": [torch.float16],
+        "B": [2],
+        "S1": [6],
+        "S2": [128],
+        "N1": [8],
+        "N2": [1],
+        "D": [512],
+        "K": [16],
+        "scale_value": [1.0 / math.sqrt(576)],
+        "sparse_block_size": [1],
+        "rope_head_dim": [64],
+        "sparse_mode": [0],
+        "attention_mode": [2],
+        "return_softmax_lse": [True],  # ⋆ LSE 验证
+        "actual_seq_q": [[4, 6]],
+        "actual_seq_kv": [[128, 128]],
+    },
 }
 
 
 ENABLED_PARAMS = [
     TEST_PARAMS["bsnd_basic"],
     TEST_PARAMS["bsnd_multi_batch"],
-    TEST_PARAMS["pa_bsnd"], 
+    TEST_PARAMS["pa_bsnd"],
     TEST_PARAMS["tnd_basic"],
     TEST_PARAMS["tnd_pa_multi_batch"],
+    TEST_PARAMS["bsnd_lse"],  # LSE 回归
 ]
