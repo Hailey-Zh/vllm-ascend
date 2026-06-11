@@ -99,15 +99,51 @@ pytest . -s -v
 
 ## framework/ —— golden 回归框架
 
-paramset 直跑（默认 `sparse_flash_attention_paramset.py` 的 6 组用例，含 LSE 回归）：
+统一入口 `test_run.sh <模式>`，在 `framework/` 目录下执行。共 4 个模式：
 
 ```bash
 cd framework
-bash test_run.sh single                  # 跑 paramset
-bash run_baseline.sh                      # 5 个 baseline 用例一键回归
+bash test_run.sh single                  # ① paramset 直跑（最常用）
+bash run_baseline.sh                      # 5 个 baseline 用例一键回归（封装 single）
 ```
 
-其它模式（Excel 批量生成 .pt、回放执行等）见 `framework/RUN_ON_NPU.md` 与 `test_run.sh` 内注释。
+### 模式速查
+
+| 模式 | 作用 | 主要选项（可省略用默认） |
+|---|---|---|
+| `single` | 用 paramset 直接构造输入 → CPU golden + NPU + 精度对比 | `-P <paramset 文件名>`（默认 `sparse_flash_attention_paramset`） |
+| `gen_excel_from_paramset` | 从 paramset 生成 Excel 用例表 | `-P <paramset>` `-E <输出 xlsx>` `-S <sheet>` |
+| `batch_save` | 从 Excel 读参数 → 生成含 CPU golden 的 `.pt` 用例文件 | `-E <xlsx>`（默认 `./excel/example.xlsx`）`-S <sheet>` `-P <pt 保存目录>`（默认 `./pt_files/`） |
+| `batch_exec` | 回放 `.pt` → 拉起 NPU 算子并对比精度 | `-P <pt 目录或单个 .pt 文件>`（默认 `./pt_files/`） |
+
+> 选项顺序任意；`-E` Excel 路径、`-S` Sheet 名、`-P` 路径/文件名。`bash test_run.sh help` 看完整帮助。
+
+### Excel 批量生成 .pt + 回放执行（完整工作流）
+
+适合一次准备一批用例、反复回放（改完 kernel 重跑同一批用例做回归）：
+
+```bash
+cd framework
+
+# 1) 从 paramset 生成 Excel（也可手填 Excel，列名见下）
+bash test_run.sh gen_excel_from_paramset -E ./excel/my_cases.xlsx -S Sheet1
+
+# 2) 从 Excel 生成 .pt（每个用例含 CPU golden，存到 ./pt_files/）
+bash test_run.sh batch_save -E ./excel/my_cases.xlsx -S Sheet1 -P ./pt_files/
+
+# 3) 回放 .pt 跑 NPU + 精度对比（整目录，或指定单个 .pt）
+bash test_run.sh batch_exec -P ./pt_files/
+bash test_run.sh batch_exec -P ./pt_files/sfa_bsnd_basic_xxx.pt   # 单个
+```
+
+Excel 用例表列名需与框架字段一致（示例）：
+
+| Testcase_Prefix | layout_query | layout_kv | q_type | kv_type | B | T1 | T2 | S1 | S2 | N1 | N2 | D | K | scale_value | sparse_block_size | rope_head_dim | sparse_mode | attention_mode | return_softmax_lse | block_size | block_num | actual_seq_q | actual_seq_kv |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sfa_bsnd | BSND | BSND | torch.float16 | torch.float16 | 1 |  |  | 5 | 262144 | 8 | 1 | 512 | 16 | 0.04419 | 1 | 64 | 0 | 2 | False |  |  | [4] | [4] |
+| sfa_tnd | TND | TND | torch.float16 | torch.float16 | 2 | 8 | 3072 | 4 | 3072 | 8 | 1 | 512 | 32 | 0.04419 | 1 | 64 | 0 | 2 | False |  |  | [4,8] | [1111,3000] |
+
+更深入的 NPU 侧环境与逐步回归说明见 `framework/RUN_ON_NPU.md`。
 
 ### 当前支持范围（算子约束）
 
