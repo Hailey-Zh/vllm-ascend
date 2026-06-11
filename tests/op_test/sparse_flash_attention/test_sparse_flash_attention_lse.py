@@ -275,6 +275,7 @@ def test_lse_bsnd_bsnd_mode0():
         layout_query="BSND", layout_kv="BSND",
         sparse_mode=0,
         return_softmax_lse=True,
+        return_packed_kv=False,
     )
     torch.npu.synchronize()
     attn_out, lse_max, lse_sum, _, _ = output
@@ -323,6 +324,7 @@ def test_lse_bsnd_bsnd_mode3():
         layout_query="BSND", layout_kv="BSND",
         sparse_mode=3,
         return_softmax_lse=True,
+        return_packed_kv=False,
     )
     torch.npu.synchronize()
     attn_out, lse_max, lse_sum, _, _ = output
@@ -383,6 +385,7 @@ def test_lse_bsnd_pa_bsnd_mode3():
         layout_query="BSND", layout_kv="PA_BSND",
         sparse_mode=3,
         return_softmax_lse=True,
+        return_packed_kv=False,
     )
     torch.npu.synchronize()
     attn_out, lse_max, lse_sum, _, _ = output
@@ -448,6 +451,7 @@ def test_lse_tnd_tnd_mode0():
         layout_query="TND", layout_kv="TND",
         sparse_mode=0,
         return_softmax_lse=True,
+        return_packed_kv=False,
     )
     torch.npu.synchronize()
     attn_out, lse_max, lse_sum, _, _ = output
@@ -520,6 +524,7 @@ def test_lse_tnd_pa_bsnd_mode3():
         layout_query="TND", layout_kv="PA_BSND",
         sparse_mode=3,
         return_softmax_lse=True,
+        return_packed_kv=False,
     )
     torch.npu.synchronize()
     attn_out, lse_max, lse_sum, _, _ = output
@@ -573,6 +578,7 @@ def test_lse_varying_actual_seq():
         layout_query="BSND", layout_kv="BSND",
         sparse_mode=0,
         return_softmax_lse=True,
+        return_packed_kv=False,
     )
     torch.npu.synchronize()
     attn_out, lse_max, lse_sum, _, _ = output

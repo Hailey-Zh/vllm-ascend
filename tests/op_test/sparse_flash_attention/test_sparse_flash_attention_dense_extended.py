@@ -63,6 +63,7 @@ def _call_op(query, key, value, sparse_indices, *,
         layout_query=layout_query, layout_kv=layout_kv,
         sparse_mode=0,
         return_softmax_lse=return_softmax_lse,
+        return_packed_kv=False,
     )
 
 
@@ -265,6 +266,7 @@ def test_dense_lse_bsnd_bsnd():
         layout_query="BSND", layout_kv="BSND",
         sparse_mode=0,
         return_softmax_lse=True,
+        return_packed_kv=False,
     )
     torch.npu.synchronize()
     attn_out, lse_max, lse_sum, _, _ = output
