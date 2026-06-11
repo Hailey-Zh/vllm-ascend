@@ -203,6 +203,55 @@ def test_ctemplate_vs_cpu_golden():
     assert diff_c < 3e-3, f"C_TEMPLATE 对 CPU golden 偏离: {diff_c:.6e}"
 
 
+def _cpu_mla_golden_subset(query, key, value, query_rope, key_rope, scale, sel):
+    # 同 _cpu_mla_dense_golden，但只在 sel（token 下标列表）这些 KV token 上做 attention。
+    q = query.float().cpu()
+    qr = query_rope.float().cpu()
+    k0 = key.float().cpu()[:, sel, 0, :]
+    v0 = value.float().cpu()[:, sel, 0, :]
+    kr0 = key_rope.float().cpu()[:, sel, 0, :]
+    B, S1, N1, D = q.shape
+    out = torch.empty(B, S1, N1, D, dtype=torch.float32)
+    for b in range(B):
+        for h in range(N1):
+            s_nope = q[b, :, h, :] @ k0[b].transpose(0, 1)
+            s_rope = qr[b, :, h, :] @ kr0[b].transpose(0, 1)
+            p = torch.softmax((s_nope + s_rope) * scale, dim=-1)
+            out[b, :, h, :] = p @ v0[b]
+    return out
+
+
+def test_vtemplate_trigger_scan():
+    # 触发条件扫描：固定 shape，只变"选中的 token 数 K"（indices=[0..K-1]），
+    # 对比 V_TEMPLATE(block_size=1) 与同一子集上的 CPU golden。看 diff 从哪个 K 开始变大。
+    torch.manual_seed(42)
+    B, S1, S2, N1, N2, D, ROPE = 2, 4, 128, 8, 1, 512, 64
+    device = "npu"
+    dtype = torch.float16
+    query = (torch.randn(B, S1, N1, D, dtype=dtype, device=device) * 0.1)
+    key = (torch.randn(B, S2, N2, D, dtype=dtype, device=device) * 0.1)
+    value = (torch.randn(B, S2, N2, D, dtype=dtype, device=device) * 0.1)
+    query_rope = (torch.randn(B, S1, N1, ROPE, dtype=dtype, device=device) * 0.1)
+    key_rope = (torch.randn(B, S2, N2, ROPE, dtype=dtype, device=device) * 0.1)
+    actual_seq_q = torch.tensor([S1, S1], dtype=torch.int32, device=device)
+    actual_seq_kv = torch.tensor([S2, S2], dtype=torch.int32, device=device)
+
+    print("\n[scan] V_TEMPLATE(bs=1) vs CPU golden，按选中 token 数 K：")
+    for K in [1, 2, 7, 8, 16, 31, 32, 48, 64, 96, 120, 127, 128]:
+        idx = (torch.arange(K, dtype=torch.int32, device=device)
+               .view(1, 1, 1, K).expand(B, S1, N2, K).contiguous())
+        out = _call_op(
+            query=query, key=key, value=value, sparse_indices=idx, sparse_block_size=1,
+            block_table=None, actual_seq_q=actual_seq_q, actual_seq_kv=actual_seq_kv,
+            query_rope=query_rope, key_rope=key_rope, layout_query="BSND", layout_kv="BSND",
+        )[0].float().cpu()
+        torch.npu.synchronize()
+        golden = _cpu_mla_golden_subset(query, key, value, query_rope, key_rope, SCALE, list(range(K)))
+        diff = (out - golden).abs().max().item()
+        flag = "  <-- 错" if diff > 3e-3 else ""
+        print(f"[scan] K={K:4d}  max_abs_diff={diff:.6e}{flag}")
+
+
 def test_ctemplate_mm2_constant_value():
     # mm2 / softmax 归一化隔离：把所有 V 行设成 per-batch 常量 v0。
     # 任意正确的 attention 都应输出 out == v0（softmax 权重和为 1，与 QK 分数无关）。
