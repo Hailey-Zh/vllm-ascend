@@ -198,15 +198,17 @@ def test_packed_kv_tnd_tnd():
     assert tuple(packed_key.shape) == (T1, N2, K, D)
     assert tuple(packed_key_rope.shape) == (T1, N2, K, ROPE)
 
-    # Resolve TND key to BSND for reference
+    # Resolve TND key ([T2, N2, *]) to BSND for reference
     S2 = int(max(kv_len))
     key_bsnd = torch.zeros(B, S2, N2, D, dtype=dtype)
     key_rope_bsnd = torch.zeros(B, S2, N2, ROPE, dtype=dtype)
+    key_cpu = key.cpu()
+    key_rope_cpu = key_rope.cpu()
     off = 0
     for b in range(B):
         act_kv = kv_len[b]
-        key_bsnd[b, :act_kv] = key[off:off + act_kv].unsqueeze(1)
-        key_rope_bsnd[b, :act_kv] = key_rope[off:off + act_kv].unsqueeze(1)
+        key_bsnd[b, :act_kv] = key_cpu[off:off + act_kv]
+        key_rope_bsnd[b, :act_kv] = key_rope_cpu[off:off + act_kv]
         off += act_kv
 
     ek, er = _gather_ref_tnd(key_bsnd, key_rope_bsnd, sparse_indices, cum_q)
