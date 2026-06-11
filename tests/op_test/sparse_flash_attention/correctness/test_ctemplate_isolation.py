@@ -252,6 +252,45 @@ def test_vtemplate_trigger_scan():
         print(f"[scan] K={K:4d}  max_abs_diff={diff:.6e}{flag}")
 
 
+def test_vtemplate_ignores_indices():
+    # 一锤定音：选单个"非前缀"token t=64（indices=[[64]], K=1）。
+    #   - 正确稀疏  => out == value[64]
+    #   - H3(无视 indices，全量 attend [0,128)) => out == 全量 attention，且 != value[64]
+    # 同时对照 C_TEMPLATE 无法在此直接验证（K=1 凑不出 block_size>4 的单 token），故只测 V。
+    torch.manual_seed(42)
+    B, S1, S2, N1, N2, D, ROPE = 2, 4, 128, 8, 1, 512, 64
+    device = "npu"
+    dtype = torch.float16
+    query = (torch.randn(B, S1, N1, D, dtype=dtype, device=device) * 0.1)
+    key = (torch.randn(B, S2, N2, D, dtype=dtype, device=device) * 0.1)
+    value = (torch.randn(B, S2, N2, D, dtype=dtype, device=device) * 0.1)
+    query_rope = (torch.randn(B, S1, N1, ROPE, dtype=dtype, device=device) * 0.1)
+    key_rope = (torch.randn(B, S2, N2, ROPE, dtype=dtype, device=device) * 0.1)
+    actual_seq_q = torch.tensor([S1, S1], dtype=torch.int32, device=device)
+    actual_seq_kv = torch.tensor([S2, S2], dtype=torch.int32, device=device)
+
+    t = 64
+    idx = torch.tensor([t], dtype=torch.int32, device=device).view(1, 1, 1, 1).expand(B, S1, N2, 1).contiguous()
+    out = _call_op(
+        query=query, key=key, value=value, sparse_indices=idx, sparse_block_size=1,
+        block_table=None, actual_seq_q=actual_seq_q, actual_seq_kv=actual_seq_kv,
+        query_rope=query_rope, key_rope=key_rope, layout_query="BSND", layout_kv="BSND",
+    )[0].float().cpu()
+    torch.npu.synchronize()
+
+    golden_indexed = _cpu_mla_golden_subset(query, key, value, query_rope, key_rope, SCALE, [t])  # 正确稀疏
+    golden_full = _cpu_mla_golden_subset(query, key, value, query_rope, key_rope, SCALE, list(range(S2)))  # 全量
+    golden_prefix = _cpu_mla_golden_subset(query, key, value, query_rope, key_rope, SCALE, [0])  # 选前缀(token0)
+
+    d_idx = (out - golden_indexed).abs().max().item()
+    d_full = (out - golden_full).abs().max().item()
+    d_pref = (out - golden_prefix).abs().max().item()
+    print(f"\n[uses-indices] 选 token {t}：")
+    print(f"[uses-indices]  vs golden_indexed(value[{t}]) = {d_idx:.6e}  (≈0 则 V 正确按 indices 取数)")
+    print(f"[uses-indices]  vs golden_full([0,128))       = {d_full:.6e}  (≈0 则 V 无视 indices 做全量 attend)")
+    print(f"[uses-indices]  vs golden_prefix(value[0])    = {d_pref:.6e}  (≈0 则 V 取了前缀 token0)")
+
+
 def test_ctemplate_mm2_constant_value():
     # mm2 / softmax 归一化隔离：把所有 V 行设成 per-batch 常量 v0。
     # 任意正确的 attention 都应输出 out == v0（softmax 权重和为 1，与 QK 分数无关）。
