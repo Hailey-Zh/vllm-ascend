@@ -1,14 +1,16 @@
 # sparse_flash_attention 算子测试
 
-`torch.ops._C_ascend.npu_sparse_flash_attention` 的测试集，分为两套独立体系：
+`torch.ops._C_ascend.npu_sparse_flash_attention` 的测试集，分为三套独立体系：
 
 | 体系 | 目录 | 验证方式 | 触发 |
 |---|---|---|---|
 | **correctness** | `correctness/` | 直调算子 + PyTorch 参考实现逐元素比对 | `pytest -m <marker>` |
 | **framework** | `framework/` | paramset/Excel → CPU golden → NPU 精度比对 | `bash test_run.sh <模式>` |
+| **benchmark** | `benchmark/` | 各功能 × 不同 shape 的时延测量（非精度） | `pytest -m bench` |
 
 - `correctness/`：每个功能点一个独立测试文件，参考值在文件内用 PyTorch 现写，按 pytest marker 选择性运行。改造新增功能（LSE / dense / packed_kv）的精度验证主要在这里。
 - `framework/`：原 ops-transformer arch22 移植的回归框架，覆盖大 shape / 多 batch / bf16 的 attn_out 回归。
+- `benchmark/`：测时延不测精度，decode + prefill 两类负载，结果打印汇总表并落盘 CSV。
 
 ```
 sparse_flash_attention/
@@ -34,6 +36,9 @@ sparse_flash_attention/
 │   ├── run_baseline.sh                         # 5 个 baseline 用例一键回归
 │   ├── RUN_ON_NPU.md                           # NPU 侧环境与回归详细说明
 │   └── batch/ , excel/                         # Excel 批量用例生成 / 回放
+├── benchmark/                 # 时延 benchmark
+│   ├── bench_sfa.py                            # 计时框架 + shape 表 + 汇总输出
+│   └── results/                                # CSV 输出（.gitignore）
 └── diag/                      # 调试用 shell 脚本（aclnn nullptr / 重编译等）
 ```
 
@@ -161,6 +166,32 @@ Excel 用例表列名需与框架字段一致（示例）：
 
 - `result.xlsx`：每个用例的入参、状态与 `fulfill_percent`
 - `pt_files/*.pt`：batch 流程生成的中间用例
+
+---
+
+## benchmark/ —— 时延测试
+
+测各功能在不同 shape 下的 kernel 时延（**不测精度**），覆盖 decode（`S1=1`、大 `S2`）与
+prefill（大 `S1`）两类负载，fp16 + bf16。计时用 `npu.Event`（不可用时回退
+`perf_counter`+`synchronize`），warmup 后取多次迭代的 **mean / p50 / p90 (ms)**。
+
+```bash
+cd benchmark
+pytest bench_sfa.py -m bench -s -v          # pytest 方式（跑整张 shape 表）
+
+# 或独立运行，带参数：
+python bench_sfa.py                          # 默认 warmup=10 iters=50
+python bench_sfa.py --warmup 20 --iters 100  # 自定义迭代次数
+python bench_sfa.py --filter decode          # 只跑名字含 decode 的 shape
+python bench_sfa.py --csv ./my_run.csv       # 指定 CSV 输出路径
+```
+
+输出：控制台汇总表 + `benchmark/results/bench_sfa_<时间戳>.csv`（CSV 已 gitignore，仅本地留存）。
+表头 `feat / layout / dt / B / S1 / S2 / N1 / K / mean / p50 / p90`。
+
+> 改 shape 表直接编辑 `bench_sfa.py` 的 `_build_grid()`；每行
+> `(name, feature, layout_q, layout_kv, dtype, B, S1, S2, N1, K)`，`feature ∈ {basic,lse,dense,packed}`。
+> 某个 shape 跑挂不会中断整轮，会在该行标 `ERROR` 继续跑下一个。
 
 ---
 

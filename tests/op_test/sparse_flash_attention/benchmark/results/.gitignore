@@ -1,0 +1,2 @@
+# benchmark CSV outputs are run artifacts; keep the dir, ignore the data
+bench_sfa_*.csv
