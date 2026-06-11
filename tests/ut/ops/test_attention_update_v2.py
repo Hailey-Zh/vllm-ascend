@@ -26,6 +26,9 @@ try:
 except (ImportError, RuntimeError):
     HAS_NPU = False
 
+from vllm_ascend.utils import enable_custom_op
+enable_custom_op()
+
 SEED = 42
 
 
