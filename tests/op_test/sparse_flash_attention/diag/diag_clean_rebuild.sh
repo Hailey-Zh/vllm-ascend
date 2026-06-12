@@ -26,6 +26,12 @@ set -u
 SOC="${1:-}"
 MODE="${2:-all}"
 
+# 从脚本自身位置推导算子目录/名，使脚本可直接复用到别的算子（目录结构需为
+# tests/op_test/<op>/diag/diag_clean_rebuild.sh）。BASH_SOURCE 不受调用时 cwd 影响。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OP_DIR="$(dirname "$SCRIPT_DIR")"          # tests/op_test/<op>
+OP_NAME="$(basename "$OP_DIR")"            # 例如 sparse_flash_attention
+
 # 定位仓库根目录
 ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null)"
 if [[ -z "$ROOT_DIR" ]]; then
@@ -66,15 +72,15 @@ rebuild_layer1() {
     # 失败但未传播）。这里确认 sparse_flash_attention 的产物真的进了 vendors，否则运行期
     # 会报 "binary bin not found"。
     local sfa_artifacts
-    sfa_artifacts=$(find vllm_ascend/_cann_ops_custom/vendors -iname "*sparse_flash_attention*" 2>/dev/null | head -5)
+    sfa_artifacts=$(find vllm_ascend/_cann_ops_custom/vendors -iname "*${OP_NAME}*" 2>/dev/null | head -5)
     if [[ -z "$sfa_artifacts" ]]; then
-        echo "[FATAL] 层1 build 后 vendors 里找不到 sparse_flash_attention 产物！" >&2
+        echo "[FATAL] 层1 build 后 vendors 里找不到 ${OP_NAME} 产物！" >&2
         echo "        说明算子包没真正构建（soc 空跑 / kernel binary gen 失败）。" >&2
-        echo "        请检查上面的 build 日志里 sparse_flash_attention 段是否有 error / no matching function。" >&2
+        echo "        请检查上面的 build 日志里 ${OP_NAME} 段是否有 error / no matching function。" >&2
         exit 1
     fi
     echo "=== [层1] 完成 ==="
-    echo "    sparse_flash_attention 产物（节选）:"
+    echo "    ${OP_NAME} 产物（节选）:"
     echo "$sfa_artifacts"
     echo
 }
@@ -120,28 +126,31 @@ esac
 # 否则执行算子报 EZ9999 AclNN_Inner_Error: "The binary bin not found!"（官方解释为
 # "检查环境变量是否正确"）。注意：脚本里 source 只对本脚本 shell 生效，退出后不保留，
 # 所以下面既在脚本内 source（让本脚本的验证可用），也在结尾打印命令提醒你在自己的 shell 再跑一次。
-SET_ENV="$ROOT_DIR/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/bin/set_env.bash"
-if [[ -f "$SET_ENV" ]]; then
+# vendor 目录名不写死（一般是 vllm-ascend），用通配兜底
+SET_ENV="$(ls "$ROOT_DIR"/vllm_ascend/_cann_ops_custom/vendors/*/bin/set_env.bash 2>/dev/null | head -1)"
+if [[ -n "$SET_ENV" && -f "$SET_ENV" ]]; then
     echo "=== source set_env.bash（注册算子二进制查找路径） ==="
     # shellcheck disable=SC1090
     source "$SET_ENV"
     echo "    sourced: $SET_ENV"
     echo
 else
-    echo "[WARN] 未找到 $SET_ENV（layer2-only 模式且从未建过算子包？）" >&2
+    SET_ENV="$ROOT_DIR/vllm_ascend/_cann_ops_custom/vendors/*/bin/set_env.bash"
+    echo "[WARN] 未找到 set_env.bash（匹配 $SET_ENV）；layer2-only 模式且从未建过算子包？" >&2
     echo
 fi
 
 echo "=== 验证：算子是否重新注册 ==="
 # 注意：必须 enable_custom_op() 才会真正加载/注册自定义算子，
 # 光 import vllm_ascend 不会，hasattr 会是 False（误判）。
-python -c "
+"${PYTHON:-python3}" -c "
 import torch
 import torch_npu  # noqa: registers npu device
 import vllm_ascend  # noqa
 from vllm_ascend.utils import enable_custom_op
 enable_custom_op()
-print('npu_sparse_flash_attention registered:', hasattr(torch.ops._C_ascend, 'npu_sparse_flash_attention'))
+op = 'npu_${OP_NAME}'
+print(op, 'registered:', hasattr(torch.ops._C_ascend, op))
 "
 echo
 echo "################################################################################"
@@ -149,6 +158,10 @@ echo "# 跑回归前，必须先在你当前的 shell 里 source 环境变量（
 echo "#"
 echo "#   source $SET_ENV"
 echo "#"
-echo "# 然后："
-echo "#   cd tests/op_test/sparse_flash_attention/framework && bash test_run.sh single"
+echo "# 然后跑回归："
+echo "#   cd tests/op_test/$OP_NAME"
+echo "#   pytest correctness/ -s -v"
+if [[ -f "$OP_DIR/framework/test_run.sh" ]]; then
+    echo "#   cd framework && bash test_run.sh single        # 框架集成 + CPU golden 对比"
+fi
 echo "################################################################################"

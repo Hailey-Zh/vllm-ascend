@@ -6,6 +6,39 @@
 
 ---
 
+## 构建与接入
+
+这个算子有**两层独立产物**，改不同文件要重建不同层：
+
+| 你改了什么 | 要重建哪层 |
+|---|---|
+| `op_kernel/*`、`op_host/*`（def/proto/tiling/kernel） | **层1**：CANN 算子包 |
+| `torch_binding*`、`*_torch_adpt.h` | **层2**：Python 扩展 `_C_ascend.so` |
+| `def` 接口（影响两层签名） | **两层都要** |
+
+用一键脚本重建（在仓库内任意目录跑都行，脚本会自动定位仓库根）：
+
+```bash
+# 全清重建两层（改了 def 接口时用）
+bash tests/op_test/sparse_flash_attention/diag/diag_clean_rebuild.sh ascend910b
+
+# 只重建算子包（改了 kernel/tiling）
+bash tests/op_test/sparse_flash_attention/diag/diag_clean_rebuild.sh ascend910b layer1
+
+# 只重建 Python 扩展（改了 torch_adpt / binding）
+bash tests/op_test/sparse_flash_attention/diag/diag_clean_rebuild.sh "" layer2
+```
+
+参数：第 1 个是 SoC（`ascend910b` / `ascend910_93`，层1 必填），第 2 个是模式（`all`默认 / `layer1` / `layer2`）。
+
+> ⚠️ **重建算子包后，必须在你自己的 shell 里 source 一次环境变量**，否则运行算子会报 `EZ9999 ... binary bin not found`：
+> ```bash
+> source vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/bin/set_env.bash
+> ```
+> 脚本内部的 `source` 只对脚本自身生效、退出后不保留，所以它会在结尾打印这条命令提醒你手动再跑一次。脚本本身会自动校验算子产物是否真的进了 `vendors/`、并验证算子是否注册成功。
+
+接入 Python 侧只要：`import vllm_ascend` 注册算子，再 `enable_custom_op()` 真正加载，之后即可调用 `torch.ops._C_ascend.npu_sparse_flash_attention(...)`。
+
 ## 一分钟上手
 
 ```python
