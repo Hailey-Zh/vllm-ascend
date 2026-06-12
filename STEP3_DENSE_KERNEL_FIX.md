@@ -3,6 +3,29 @@
 > 独立任务,后面单开一个对话查。本文档不提交(仓库文档不进 commit)。
 > 读完即可冷启动。相关讨论发生在 step 4a 期间(2026-06-09)。
 > **2026-06-11 更新**：根因已定位，不是 IS_DENSE 分支的问题，见下方"真实根因"。
+> **2026-06-12 更新**：dummy 已去除，dense 走 C_TEMPLATE 快路，4 种 layout 全部验证通过。
+> 仍遗留 V_TEMPLATE 的 P×K bug（见文末"遗留 bug"）。
+
+## ★★ 最终状态（2026-06-12，已闭环）
+
+**dense 这条线已完成**：
+
+1. **dummy 已去除**（`torch_adpt.h` 不再造 arange，`sparse_indices=None` 按 OPTIONAL 透传 null）。
+   dense → `isDenseMode=true` → 走 C_TEMPLATE 真快路，省掉每次 4~8MB 的 arange 实例化。
+2. **dense 正确性全面验证**（`correctness/test_dense.py`，4 种 layout，dense vs CPU golden，key≠value）：
+
+   | layout (Q/KV) | dense vs C_TEMPLATE bs=8 | dense vs CPU golden |
+   |---|---|---|
+   | BSND / BSND | 0.0 | 1.73e-5 |
+   | BSND / PA_BSND | 0.0 | 1.26e-5 |
+   | TND / TND | 0.0 | 2.03e-5 |
+   | TND / PA_BSND | 0.0 | 1.46e-5 |
+
+3. **isDense 分支被证明正确**：dense(isDense=true) 与 sparse C_TEMPLATE(isDense=false) 逐位相等（0.0），
+   那 4 处 `if constexpr(isDense)` 分支与 sparse 路径完全等价——文档最初担心的东西其实没问题。
+4. **V_TEMPLATE 路径未退化**：`test_run.sh single` 5 用例仍全 PASS（去 dummy 不影响 bs≤4 路径）。
+
+**还没做**：修 V_TEMPLATE 的 P×K bug（见文末"遗留 bug"）。这是独立任务，MLA 实际场景 key==value 不触发。
 
 ## 一句话目标
 
@@ -185,3 +208,49 @@ pytest correctness/test_dense.py -s -v
 - 改 op_kernel/* → 重建 layer1;改 torch_adpt → 重建 layer2。
 - V_TEMPLATE 的 `sparse_indices` 取数逻辑（`GetRealS2Idx`/`CopyInKv`）本身是正确的，问题只在 mm2 读值源。
 - 框架 `check_result` 的对比（`np.isclose atol=2.5e-5`）对 out≈0 的 case 可能虚假通过，golden 输出量级很小时需注意。
+- **测试 value 不要用 `randn*0.1`**：输出全挤在 ±0.1，对错都难分（diff 数值失真）。用 `value[j]=j` 探针或解析 golden 才能放大误差。
+
+---
+
+## 遗留 bug：V_TEMPLATE 的 mm2 读 K 当 V（P×K）
+
+> 独立任务，未修。MLA 实际场景 key==value 不触发；只有传独立 key/value 才暴露。
+
+### 现象
+- V_TEMPLATE（`block_size≤4` 的稀疏主力路径）在 `key≠value` 时输出错误，对 CPU golden 偏离 ~4.6e-2。
+- `key==value` 时正确（P×K == P×V，bug 被掩盖）。
+
+### 根因
+`ComputeMm2`（P×V 矩阵乘）的 V_TEMPLATE 分支从 `kvMergeGm_` workspace 读 B 矩阵，
+但该 workspace 只有 `MergeKv` 写入的 **K 和 K_rope**，**没有 Value**。所以 mm2 实际算 P×K。
+
+代码位置：
+| 文件 | 行 | 内容 |
+|---|---|---|
+| `op_kernel/sparse_flash_attention_service_vector_mla.h` | 964 `MergeKv` / 834 `CopyInSingleKv` / 925 `CopyOutMrgeResult` | 只 gather/写 K + K_rope，无 V |
+| `op_kernel/sparse_flash_attention_service_cube_mla.h` | 899-912 | `ComputeMm2` V_TEMPLATE 分支从 `kvMergeGm_` 读"V"（实为 K） |
+| 同上 | 913-955 | else 分支：C_TEMPLATE 从 `valueGm` 正确直读 |
+
+### 为什么一直没发现
+框架 golden `tests/.../framework/sparse_flash_attention_golden.py:289`：`"value": raw["key"]`，
+所有 single 用例 key==value。5 个 single 用例 + dense-via-dummy 全走 V_TEMPLATE 且全 key==value，所以全 PASS。
+
+### 归属
+原始 bug，commit `18b90b50`（Song Mingyang，2025-12-03，第一版 SFA 算子）。
+我们的改动（`34235b88` 构建、`7a23e086` step3c）都不在 V_TEMPLATE mm2 路径，与此无关。
+
+### 修复方向
+- **方案 A（推荐，改动小）**：去掉 `cube_mla.h:899` 的 `if constexpr(TEMPLATE_MODE==V_TEMPLATE)` 抄近道，
+  让 V_TEMPLATE 的 mm2 也走 913 行 else 分支（`while`+`CalcTopKBlockInfo`+`CopyInMm2BToL1`）从 `valueGm` 直读。
+- **方案 B（保性能）**：在 Queue2 前加一次 value merge（MergeKv 风格），写入 `kvMergeGm_` 的 V 区。改动大（workspace 布局 + 同步流水）。
+- 先做 A，性能退化再考虑 B。
+
+### 验证手段（无需 rebuild，已有测试）
+```bash
+cd tests/op_test/sparse_flash_attention
+# V bug 复现（key≠value）：
+pytest correctness/test_ctemplate_isolation.py::test_vtemplate_token_id_probe -s -v   # V 输出≈0
+pytest correctness/test_ctemplate_isolation.py::test_key_equals_value -s -v           # key==value 时 V 正确
+pytest correctness/test_v_trigger.py -s -v
+```
+修复后这些测试里 V_TEMPLATE 应降到 ~1e-5。
