@@ -62,6 +62,24 @@ def _call_op(query, key, value, sparse_indices, *,
     )
 
 
+def _cpu_golden(query, key, value, query_rope, key_rope, scale):
+    # 连续 BSND 形式的 CPU dense attention 参考（fp32），GQA N2=1。
+    # key/value/key_rope: [B,S2,N2,D] 连续（PA case 需先还原）。
+    q = query.float().cpu()
+    qr = query_rope.float().cpu()
+    k0 = key.float().cpu()[:, :, 0, :]
+    v0 = value.float().cpu()[:, :, 0, :]
+    kr0 = key_rope.float().cpu()[:, :, 0, :]
+    B, S1, N1, D = q.shape
+    out = torch.empty(B, S1, N1, D, dtype=torch.float32)
+    for b in range(B):
+        for h in range(N1):
+            s = q[b, :, h, :] @ k0[b].transpose(0, 1) + qr[b, :, h, :] @ kr0[b].transpose(0, 1)
+            p = torch.softmax(s * scale, dim=-1)
+            out[b, :, h, :] = p @ v0[b]
+    return out
+
+
 def _make_bsnd_case():
     torch.manual_seed(42)
     B, S1, S2, N1, N2, D, ROPE = 2, 4, 128, 8, 1, 512, 64
@@ -90,6 +108,8 @@ def _make_bsnd_case():
         actual_seq_q=actual_seq_q, actual_seq_kv=actual_seq_kv,
         query_rope=query_rope, key_rope=key_rope,
         layout_query="BSND", layout_kv="BSND",
+        # golden 用连续 BSND（BSND case 即原张量）
+        golden_key=key, golden_value=value, golden_key_rope=key_rope,
     )
 
 
@@ -122,6 +142,18 @@ def _make_pa_bsnd_case():
         .expand(B, S1, N2, S2 // 8)
         .contiguous()
     )
+    # 把 paged KV 按 block_table 还原成连续 [B,S2,N2,*]，供 CPU golden 使用
+    gk = torch.empty(B, S2, N2, D, dtype=dtype, device=device)
+    gv = torch.empty(B, S2, N2, D, dtype=dtype, device=device)
+    gkr = torch.empty(B, S2, N2, ROPE, dtype=dtype, device=device)
+    for b in range(B):
+        for blk in range(BLOCKS_PER_BATCH):
+            phys = int(block_table[b, blk].item())
+            sl = slice(blk * BLOCK_SIZE, (blk + 1) * BLOCK_SIZE)
+            gk[b, sl] = key_cache[phys]
+            gv[b, sl] = value_cache[phys]
+            gkr[b, sl] = key_rope_cache[phys]
+
     return dict(
         query=query, key=key_cache, value=value_cache,
         sparse_indices_full=sparse_indices_full,
@@ -129,6 +161,7 @@ def _make_pa_bsnd_case():
         actual_seq_q=actual_seq_q, actual_seq_kv=actual_seq_kv,
         query_rope=query_rope, key_rope=key_rope_cache,
         layout_query="BSND", layout_kv="PA_BSND",
+        golden_key=gk, golden_value=gv, golden_key_rope=gkr,
     )
 
 
@@ -154,6 +187,14 @@ def _run_pair_and_compare(case, tag):
     print(f"[{tag}] max_abs_diff(dense, C_TEMPLATE bs=8) = {max_abs:.6e}")
     assert torch.allclose(out_dense_cpu, out_sparse_cpu, rtol=1e-3, atol=1e-3), \
         f"[{tag}] dense vs C_TEMPLATE bs=8 mismatch: max_abs_diff={max_abs:.6e}"
+
+    # 直接对 CPU dense golden（不靠"dense==bs8"传递），把链条钉死
+    golden = _cpu_golden(case["query"], case["golden_key"], case["golden_value"],
+                         case["query_rope"], case["golden_key_rope"], SCALE)
+    diff_golden = (out_dense_cpu - golden).abs().max().item()
+    print(f"[{tag}] max_abs_diff(dense, CPU golden)     = {diff_golden:.6e}")
+    assert torch.allclose(out_dense_cpu, golden, rtol=1e-3, atol=3e-3), \
+        f"[{tag}] dense vs CPU golden mismatch: max_abs_diff={diff_golden:.6e}"
 
 
 @pytest.mark.step3c_dense
