@@ -24,10 +24,11 @@
 # (re-apply 898c895b). With the dummy present, None -> arange -> V_TEMPLATE and this test fails by
 # design (proving dense currently does NOT take the real IS_DENSE path).
 #
-# Covers three layouts:
+# Covers four layouts:
 #   - BSND / BSND        : exercises the BSND+BSND key/value offset path (no block table)
 #   - BSND / PA_BSND     : exercises DataCopyPA with isDense
 #   - TND  / TND         : variable-length packed layout (cumulative actual_seq), per-batch golden
+#   - TND  / PA_BSND     : TND query (cumulative seq) + paged kv (per-batch seq)
 #
 # Run manually:
 #   pytest test_dense.py -m step3c_dense -s -v
@@ -223,6 +224,59 @@ def _make_tnd_case():
     )
 
 
+def _make_tnd_pa_case():
+    torch.manual_seed(45)
+    B, S1, N1, N2, D, ROPE = 2, 4, 8, 1, 512, 64
+    BLOCK_SIZE = 64
+    BLOCKS_PER_BATCH = 2
+    BLOCK_NUM = B * BLOCKS_PER_BATCH  # 4
+    S2 = BLOCKS_PER_BATCH * BLOCK_SIZE  # 128
+    T1, T2 = B * S1, B * S2  # 8, 256
+    device = "npu"
+    dtype = torch.float16
+
+    query = (torch.randn(T1, N1, D, dtype=dtype, device=device) * 0.1)
+    key_cache = (torch.randn(BLOCK_NUM, BLOCK_SIZE, N2, D, dtype=dtype, device=device) * 0.1)
+    value_cache = (torch.randn(BLOCK_NUM, BLOCK_SIZE, N2, D, dtype=dtype, device=device) * 0.1)
+    query_rope = (torch.randn(T1, N1, ROPE, dtype=dtype, device=device) * 0.1)
+    key_rope_cache = (torch.randn(BLOCK_NUM, BLOCK_SIZE, N2, ROPE, dtype=dtype, device=device) * 0.1)
+
+    block_table = torch.arange(BLOCK_NUM, dtype=torch.int32, device=device).view(B, BLOCKS_PER_BATCH)
+    cum_q = [S1, 2 * S1]            # TND query: cumulative [4, 8]
+    actual_seq_q = torch.tensor(cum_q, dtype=torch.int32, device=device)
+    actual_seq_kv = torch.tensor([S2, S2], dtype=torch.int32, device=device)  # PA kv: per-batch
+    cum_kv = [S2, 2 * S2]          # golden 切片用 cumulative [128, 256]
+
+    # paged KV 还原成 TND 连续 [T2,N2,*]，按 batch 拼接
+    gk = torch.empty(T2, N2, D, dtype=dtype, device=device)
+    gv = torch.empty(T2, N2, D, dtype=dtype, device=device)
+    gkr = torch.empty(T2, N2, ROPE, dtype=dtype, device=device)
+    for b in range(B):
+        for blk in range(BLOCKS_PER_BATCH):
+            phys = int(block_table[b, blk].item())
+            dst = slice(b * S2 + blk * BLOCK_SIZE, b * S2 + (blk + 1) * BLOCK_SIZE)
+            gk[dst] = key_cache[phys]
+            gv[dst] = value_cache[phys]
+            gkr[dst] = key_rope_cache[phys]
+
+    sparse_indices_full = (
+        torch.arange(S2 // 8, dtype=torch.int32, device=device)
+        .view(1, 1, S2 // 8)
+        .expand(T1, N2, S2 // 8)
+        .contiguous()
+    )
+    return dict(
+        query=query, key=key_cache, value=value_cache,
+        sparse_indices_full=sparse_indices_full,
+        block_table=block_table,
+        actual_seq_q=actual_seq_q, actual_seq_kv=actual_seq_kv,
+        query_rope=query_rope, key_rope=key_rope_cache,
+        layout_query="TND", layout_kv="PA_BSND",
+        golden_key=gk, golden_value=gv, golden_key_rope=gkr,
+        cum_q=cum_q, cum_kv=cum_kv,
+    )
+
+
 def _run_pair_and_compare(case, tag):
     common_kwargs = {k: case[k] for k in (
         "query", "key", "value", "block_table",
@@ -273,3 +327,8 @@ def test_dense_matches_sparse_full_pa_bsnd():
 @pytest.mark.step3c_dense
 def test_dense_matches_sparse_full_tnd():
     _run_pair_and_compare(_make_tnd_case(), tag="TND/TND")
+
+
+@pytest.mark.step3c_dense
+def test_dense_matches_sparse_full_tnd_pa():
+    _run_pair_and_compare(_make_tnd_pa_case(), tag="TND/PA_BSND")
