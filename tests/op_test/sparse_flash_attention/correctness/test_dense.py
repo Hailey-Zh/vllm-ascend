@@ -24,9 +24,10 @@
 # (re-apply 898c895b). With the dummy present, None -> arange -> V_TEMPLATE and this test fails by
 # design (proving dense currently does NOT take the real IS_DENSE path).
 #
-# Covers two layouts:
+# Covers three layouts:
 #   - BSND / BSND        : exercises the BSND+BSND key/value offset path (no block table)
 #   - BSND / PA_BSND     : exercises DataCopyPA with isDense
+#   - TND  / TND         : variable-length packed layout (cumulative actual_seq), per-batch golden
 #
 # Run manually:
 #   pytest test_dense.py -m step3c_dense -s -v
@@ -77,6 +78,28 @@ def _cpu_golden(query, key, value, query_rope, key_rope, scale):
             s = q[b, :, h, :] @ k0[b].transpose(0, 1) + qr[b, :, h, :] @ kr0[b].transpose(0, 1)
             p = torch.softmax(s * scale, dim=-1)
             out[b, :, h, :] = p @ v0[b]
+    return out
+
+
+def _cpu_golden_tnd(query, key, value, query_rope, key_rope, scale, cum_q, cum_kv):
+    # TND 变长打包：query [T1,N1,D]，KV [T2,N2,D]，cum_q/cum_kv 是 cumulative 边界。
+    # 每个 batch 的 query 段只 attend 该 batch 的 KV 段。GQA N2=1。
+    q = query.float().cpu()
+    qr = query_rope.float().cpu()
+    k0 = key.float().cpu()[:, 0, :]
+    v0 = value.float().cpu()[:, 0, :]
+    kr0 = key_rope.float().cpu()[:, 0, :]
+    T1, N1, D = q.shape
+    out = torch.empty(T1, N1, D, dtype=torch.float32)
+    qs, ks = 0, 0
+    for b in range(len(cum_q)):
+        qe, ke = cum_q[b], cum_kv[b]
+        for h in range(N1):
+            s = (q[qs:qe, h, :] @ k0[ks:ke].transpose(0, 1)
+                 + qr[qs:qe, h, :] @ kr0[ks:ke].transpose(0, 1))
+            p = torch.softmax(s * scale, dim=-1)
+            out[qs:qe, h, :] = p @ v0[ks:ke]
+        qs, ks = qe, ke
     return out
 
 
@@ -165,6 +188,41 @@ def _make_pa_bsnd_case():
     )
 
 
+def _make_tnd_case():
+    torch.manual_seed(44)
+    B, S1, S2, N1, N2, D, ROPE = 2, 4, 128, 8, 1, 512, 64
+    T1, T2 = B * S1, B * S2  # 8, 256
+    device = "npu"
+    dtype = torch.float16
+    query = (torch.randn(T1, N1, D, dtype=dtype, device=device) * 0.1)
+    key = (torch.randn(T2, N2, D, dtype=dtype, device=device) * 0.1)
+    value = (torch.randn(T2, N2, D, dtype=dtype, device=device) * 0.1)
+    query_rope = (torch.randn(T1, N1, ROPE, dtype=dtype, device=device) * 0.1)
+    key_rope = (torch.randn(T2, N2, ROPE, dtype=dtype, device=device) * 0.1)
+    # TND actual_seq 是 cumulative 前缀和
+    cum_q = [S1, 2 * S1]      # [4, 8]
+    cum_kv = [S2, 2 * S2]     # [128, 256]
+    actual_seq_q = torch.tensor(cum_q, dtype=torch.int32, device=device)
+    actual_seq_kv = torch.tensor(cum_kv, dtype=torch.int32, device=device)
+    # baseline bs=8：TND sparse_indices [T1, N2, K]，每 batch 内全选 128 token = 16 个 block
+    sparse_indices_full = (
+        torch.arange(S2 // 8, dtype=torch.int32, device=device)
+        .view(1, 1, S2 // 8)
+        .expand(T1, N2, S2 // 8)
+        .contiguous()
+    )
+    return dict(
+        query=query, key=key, value=value,
+        sparse_indices_full=sparse_indices_full,
+        block_table=None,
+        actual_seq_q=actual_seq_q, actual_seq_kv=actual_seq_kv,
+        query_rope=query_rope, key_rope=key_rope,
+        layout_query="TND", layout_kv="TND",
+        golden_key=key, golden_value=value, golden_key_rope=key_rope,
+        cum_q=cum_q, cum_kv=cum_kv,
+    )
+
+
 def _run_pair_and_compare(case, tag):
     common_kwargs = {k: case[k] for k in (
         "query", "key", "value", "block_table",
@@ -189,8 +247,13 @@ def _run_pair_and_compare(case, tag):
         f"[{tag}] dense vs C_TEMPLATE bs=8 mismatch: max_abs_diff={max_abs:.6e}"
 
     # 直接对 CPU dense golden（不靠"dense==bs8"传递），把链条钉死
-    golden = _cpu_golden(case["query"], case["golden_key"], case["golden_value"],
-                         case["query_rope"], case["golden_key_rope"], SCALE)
+    if case["layout_query"] == "TND":
+        golden = _cpu_golden_tnd(case["query"], case["golden_key"], case["golden_value"],
+                                 case["query_rope"], case["golden_key_rope"], SCALE,
+                                 case["cum_q"], case["cum_kv"])
+    else:
+        golden = _cpu_golden(case["query"], case["golden_key"], case["golden_value"],
+                             case["query_rope"], case["golden_key_rope"], SCALE)
     diff_golden = (out_dense_cpu - golden).abs().max().item()
     print(f"[{tag}] max_abs_diff(dense, CPU golden)     = {diff_golden:.6e}")
     assert torch.allclose(out_dense_cpu, golden, rtol=1e-3, atol=3e-3), \
@@ -205,3 +268,8 @@ def test_dense_matches_sparse_full_bsnd():
 @pytest.mark.step3c_dense
 def test_dense_matches_sparse_full_pa_bsnd():
     _run_pair_and_compare(_make_pa_bsnd_case(), tag="BSND/PA_BSND")
+
+
+@pytest.mark.step3c_dense
+def test_dense_matches_sparse_full_tnd():
+    _run_pair_and_compare(_make_tnd_case(), tag="TND/TND")
