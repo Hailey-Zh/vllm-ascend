@@ -2,6 +2,7 @@
 
 > 独立任务,后面单开一个对话查。本文档不提交(仓库文档不进 commit)。
 > 读完即可冷启动。相关讨论发生在 step 4a 期间(2026-06-09)。
+> **2026-06-11 更新**：根因已定位，不是 IS_DENSE 分支的问题，见下方"真实根因"。
 
 ## 一句话目标
 
@@ -38,67 +39,149 @@ dense 的本心 = **去除离散访存,连续整块读取并行加速**。
 这是做 IS_DENSE 快路的量化依据:不仅更快的访存,还省掉每调用的索引材料化。real dense 快路落地后,
 预期至少回收这 ~13%,加上连续读的并行收益应更多。
 
-## 当前状态(很重要)
+---
 
-- 主分支 `feature/sfa-extend`:**dummy 已恢复**(去 dummy 的实验 commit `898c895b` 已被 revert)。所以现在 dense 正确(走 sparse 路径)、稳定,但慢。
-- 复现 IS_DENSE bug 的方法:**重新应用 `898c895b` 的改动**(让 torch_adpt 把 `sparse_indices` 直接按 OPTIONAL 透传 null,而不是造 arange)。`git show 898c895b` 看 diff。
+## ★ 真实根因（2026-06-11 定位）
 
-## 症状(已观测)
+### 原始诊断是错的
 
-去掉 dummy 后(走真 IS_DENSE 路径):
-- **不再是 "binary not found"**(那是漏 source env,已解决)。dense kernel 能跑。
-- 但 `correctness/test_dense.py` 失败:
-  - BSND/BSND:`max_abs_diff(dense, sparse-full) = 4.63e-2`
-  - BSND/PA_BSND:`3.96e-2`
-  - tolerance 是 `rtol=1e-3, atol=1e-3`,差了 ~46 倍。
-- 输出是**完全不同的一组数**(不是精度噪声),说明 dense 路径在 token 遍历/取数/累加 某处算错。
-- sparse 路径(baseline `test_run.sh single` 5 用例)全过,不受影响。
+文档最初列出的 4 处 `if constexpr(SFAT::isDense)` 分支 **没有问题**。
+C_TEMPLATE（dense 走的路）已经正确——它在 `key≠value` 时对 CPU 解析 golden 的误差：
+- `max_abs_diff(C_TEMPLATE bs=8, CPU golden) = 1.73e-5` ← 完全正确
 
-## 根因区域:4 处 `if constexpr (SFAT::isDense)` 分支
+测试文件及结论：
+- `correctness/test_ctemplate_isolation.py::test_ctemplate_vs_cpu_golden`
+- `correctness/test_ctemplate_isolation.py::test_ctemplate_base_matches_vtemplate`
 
-step 3c 写的 dense 快路,跟 sparse 完全不同的取数逻辑:
+### 真正错的：V_TEMPLATE 的 mm2 抄近道读到了 K
 
-| 文件:行 | 函数 | dense 干了什么 |
+**V_TEMPLATE**（`block_size≤4` 的**稀疏主力路径**）在 `ComputeMm2`（P×V 矩阵乘）
+阶段有一个抄近道：直接从 `kvMergeGm_` workspace 连续读 B 矩阵，而不是像 C_TEMPLATE
+那样从 `valueGm` 按 token 索引读。
+
+问题在于：`kvMergeGm_` 只有 `MergeKv` 写入的 **K 和 K_rope 数据**，没有任何代码
+把 VALUE gather 进去。所以 mm2 实际算的是 **P×K** 而不是 **P×V**。
+
+相关代码位置：
+
+| 文件 | 行号 | 内容 |
 |---|---|---|
-| `op_kernel/sparse_flash_attention_kernel_mla.h:948`(函数定义 941) | `CalcSinnerTopKBegin` | `curTopKIdx` 重定义为"已处理 token 数";按 `[startPos, threshold)` 切 `s2BaseSize` 大小的连续段;不读 topKGm |
-| `op_kernel/sparse_flash_attention_service_cube_mla.h:513` | `CalcTopKBlockInfo` | `copyRowCnt = threshold - idInTopK`(一把取剩余连续块);`curOffsetInSparseBlock=0` |
-| `op_kernel/sparse_flash_attention_service_cube_mla.h:586` | `ComputeMm1` | `idInTopK = curTopKIdx`(连续位置)而非 `topKGm.GetValue(...)` |
-| `op_kernel/sparse_flash_attention_service_cube_mla.h:872` | mm2/value 取数 | dense 分支(同理用连续位置取 value) |
+| `op_kernel/sparse_flash_attention_service_vector_mla.h` | 964 | `MergeKv` — 只 gather K/K_rope |
+| 同上 | 834 | `CopyInSingleKv` — 只从 `keyGm_`/`keyRopeGm_` 读 |
+| 同上 | 925 | `CopyOutMrgeResult` — 只写 K(942行)和 K_rope(952行)到 `kvMergeGm_`，没有 V |
+| `op_kernel/sparse_flash_attention_service_cube_mla.h` | 899-912 | `ComputeMm2` V_TEMPLATE 抄近道 — 从 `kvMergeGm_` 读 B 矩阵 |
+| 同上 | 913-955 | `ComputeMm2` else 分支 — 正确从 `valueGm` 直读（C_TEMPLATE 走这条路） |
 
-对照基准:sparse 分支(同文件的 else 支)逐 block 读 topk、算 `keyOffset = (idInTopK*sparseBlockSize + curOffsetInSparseBlock) * kvHeadNum * headDim`。dense 下 `sparseBlockSize=1`、`curOffset=0`,理论上 `keyOffset = idInTopK * kvHeadNum * headDim`,连续。需要核对的就是这套连续遍历是否和 sparse 全选**逐元素等价**。
+### 为什么一直没发现（框架测试全 PASS）
 
-## 怀疑点 / 调查方向(下次从这里入手)
+框架 golden 生成时把 **value 设成了 key**（同一个 tensor）：
 
-1. **cube tiling 边界**:`CalcTopKBlockInfo` dense 把 `copyRowCnt` 设成全部剩余,下游靠 `copyFinishRowCnt + copyRowCnt > nL1Size` 截断;核对跨 `nL1`(N_SPLIT_SIZE=128)/ `kL0` chunk 时 `idInTopK` 的推进是否正确,有没有重复/漏读 token。
-2. **s2 inner-loop 切分**:`CalcSinnerTopKBegin` dense 每轮取 `min(threshold-startPos, s2BaseSize)`;核对多轮 inner-loop 拼接是否覆盖完整 [0, threshold) 无洞无叠。
-3. **mm2(value)dense 分支(cube:872)** 与 mm1 的 token 对齐:QK 和 PV 用的 token 序是否一致。
-4. **threshold 语义**:dense 测试用 `sparse_mode=0`(threshold=curActualSeqLenOri 全长);确认 dense 分支用的 threshold 与 sparse 全选一致。
-5. 手段:在 4 个 dense 分支加 `OPS_LOG_E`(OPS_LOG_I 默认不输出)打印 `idInTopK / copyRowCnt / keyOffset / actualSingleProcessSInnerSize`,跟 sparse 全选同 case 对拍。
+`tests/op_test/sparse_flash_attention/framework/sparse_flash_attention_golden.py:289`
+```python
+"value": raw["key"],
+```
 
-## 复现步骤(下次)
+当 key==value 时，P×K == P×V，V_TEMPLATE 的 bug 完全被掩盖。
 
+验证测试：`correctness/test_ctemplate_isolation.py::test_key_equals_value`
+```
+key==value 时: V vs CPU golden = 1.35e-5  ← 通过
+key!=value 时: V vs CPU golden = 4.63e-2  ← 失败
+```
+
+### bug 来源
+
+这是**原始代码的 bug**（commit `18b90b50`，Song Mingyang，2025-12-03，第一版 SFA 算子）。
+我们的 step3c commit (`7a23e086`) 改的全在 C_TEMPLATE 非 V_TEMPLATE 路径，
+与此 bug 无交集。
+
+---
+
+## 影响面
+
+| 路径 | 条件 | key≠value 时 | key==value 时 |
+|---|---|---|---|
+| C_TEMPLATE（含 IS_DENSE） | `block_size>4` 或 dense | ✓ 正确 | ✓ 正确 |
+| V_TEMPLATE（主力稀疏） | `block_size≤4` | ✗ P×K 代替 P×V | ✓ K=V 掩盖 |
+
+V_TEMPLATE 是所有 5 个 single 用例和 dense-via-dummy 的实际路径。对于 DeepSeek MLA
+使用场景，压缩 KV cache 本身就是同一个 latent（key==value），所以 bug 不触发。
+但如果有人传独立的 key/value（如 test_dense.py），V_TEMPLATE 就算错。
+
+---
+
+## 修复方向
+
+两种思路：
+
+### 方案 A：让 V_TEMPLATE 的 mm2 走 C_TEMPLATE 的 valueGm 直读路径
+- 改 `cube_mla.h:899`：去掉 `if constexpr (TEMPLATE_MODE == V_TEMPLATE)` 抄近道，
+  让 V_TEMPLATE 也走 913 行的 else 分支（`while(copyFinishRowCnt < kL0Size)` +
+  `CalcTopKBlockInfo` + `CopyInMm2BToL1`）。
+- 优点：改动小，逻辑复用 C_TEMPLATE 已验证的 value 直读。
+- 注意：V_TEMPLATE 的 `topKGm`/`sparseBlockCount` 等模板参数在 else 分支已经可用，
+  `CalcTopKBlockInfo` 非 isDense 分支和 C_TEMPLATE 共享。
+
+### 方案 B：加 value merge 步骤
+- 在 Queue2 前加一次 MergeKv 风格的 value gather，写入 `kvMergeGm_` 的 V 区域。
+- 优点：保持 V_TEMPLATE 连续读的性能优势。
+- 注意：需要调整 workspace 布局、同步流水，改动大。
+
+推荐先做方案 A（风险低、验证快），性能如有退化再做方案 B。
+
+---
+
+## 附带发现：C_TEMPLATE 已经可以落地 STEP3
+
+既然 C_TEMPLATE/dense 路径已被证明正确（vs CPU golden 1.73e-5），**去掉 arange dummy
+让 dense 走 IS_DENSE 这条目标可以先完成**，不依赖 V_TEMPLATE bug 修复。
+
+做法：
+1. 把 `test_dense.py` 的 baseline 从 `sparse-full (V_TEMPLATE)` 改为 CPU golden 或 C_TEMPLATE(bs=8)
+2. 重新应用 `898c895b` 去掉 torch_adpt 的 arange dummy
+3. 验收：`test_dense.py` 对新的 baseline 通过
+
+这样 dense 快路收益先拿到，V_TEMPLATE bug 单独修。
+
+---
+
+## 复现 / 验证命令（无需 rebuild，dummy 无关）
+
+C_TEMPLATE 验证：
+```bash
+cd tests/op_test/sparse_flash_attention
+pytest correctness/test_ctemplate_isolation.py::test_ctemplate_vs_cpu_golden -s -v
+pytest correctness/test_ctemplate_isolation.py::test_ctemplate_mm2_constant_value -s -v
+```
+
+V_TEMPLATE bug 验证：
+```bash
+pytest correctness/test_ctemplate_isolation.py::test_key_equals_value -s -v
+pytest correctness/test_ctemplate_isolation.py::test_vtemplate_trigger_scan -s -v
+pytest correctness/test_v_trigger.py -s -v
+```
+
+V_TEMPLATE 是否使用 sparse_indices 判定：
+```bash
+pytest correctness/test_ctemplate_isolation.py::test_vtemplate_ignores_indices -s -v
+pytest correctness/test_ctemplate_isolation.py::test_vtemplate_token_id_probe -s -v
+```
+
+原始 test_dense（需要先去掉 dummy）：
 ```bash
 cd /home/zhy/kv-offload-sfa/vllm-ascend
-git checkout feature/sfa-extend && git pull
-# 重新应用去 dummy 的改动以复现（或在 torch_adpt.h 手动把 sparse_indices 直接透传 null）
-git show 898c895b        # 看当时的 diff，照着改 torch_adpt.h
-# 全量重建（改了 torch_adpt 只需 layer2；若要动 kernel 则 layer1）
+git show 898c895b          # 看 diff，照着改 torch_adpt.h 去掉 arange dummy
 bash tests/op_test/sparse_flash_attention/diag/diag_clean_rebuild.sh ascend910b
-# ★ 必须 source
 source vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/bin/set_env.bash
-# 复现
 cd tests/op_test/sparse_flash_attention
 pytest correctness/test_dense.py -s -v
 ```
 
-## 验收标准
-
-- `correctness/test_dense.py` 两个用例通过(dense == sparse-full,atol/rtol 1e-3)。
-- baseline `test_run.sh single` 5 用例不退化。
-- 通过后:删掉 torch_adpt.h 的 arange dummy,dense 走 IS_DENSE 连续快路。
+---
 
 ## 注意事项(踩过的坑)
 
-- **build 后必须 `source .../vendors/vllm-ascend/bin/set_env.bash`**,否则 EZ9999 "binary bin not found"(这跟 dense 对错无关,是环境变量)。
+- **build 后必须 `source .../vendors/vllm-ascend/bin/set_env.bash`**,否则 EZ9999 "binary bin not found"。
 - 改 op_kernel/* → 重建 layer1;改 torch_adpt → 重建 layer2。
-- 这是个**独立任务**,别和 step 4(packed_kv 输出)混在一起。建议 step 4 的 4b/4c 先做完。
+- V_TEMPLATE 的 `sparse_indices` 取数逻辑（`GetRealS2Idx`/`CopyInKv`）本身是正确的，问题只在 mm2 读值源。
+- 框架 `check_result` 的对比（`np.isclose atol=2.5e-5`）对 out≈0 的 case 可能虚假通过，golden 输出量级很小时需注意。
