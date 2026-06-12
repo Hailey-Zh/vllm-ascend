@@ -43,7 +43,8 @@ def _call_op(query, key, value, sparse_indices, sparse_block_size, *,
     )
 
 
-@pytest.mark.xfail(reason="V_TEMPLATE mm2 reads K as V (P×K bug), unfixed; see STEP3_DENSE_KERNEL_FIX.md",
+@pytest.mark.xfail(reason="V_TEMPLATE assumes value==key_nope (MLA invariant); not a bug, diverges only "
+                          "with independent key!=value. See STEP3_DENSE_KERNEL_FIX.md",
                    strict=False)
 def test_v_trigger_bisect():
     """二分 V_TEMPLATE bug 触发条件：H1(哨兵-1) vs H2(全选K=S2)。"""

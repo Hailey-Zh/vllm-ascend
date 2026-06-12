@@ -104,7 +104,8 @@ def _make_bsnd_case():
     )
 
 
-@pytest.mark.xfail(reason="V_TEMPLATE mm2 reads K as V (P×K bug), unfixed; see STEP3_DENSE_KERNEL_FIX.md",
+@pytest.mark.xfail(reason="V_TEMPLATE assumes value==key_nope (MLA invariant); not a bug, diverges only "
+                          "with independent key!=value. See STEP3_DENSE_KERNEL_FIX.md",
                    strict=False)
 def test_ctemplate_base_matches_vtemplate():
     case = _make_bsnd_case()
