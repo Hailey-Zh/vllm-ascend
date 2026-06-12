@@ -71,53 +71,12 @@ npu_sparse_flash_attention(
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
 
-    // [step 3c workaround — final]
-    // For sparse_indices=None (dense mode), instead of fighting CANN's runtime nullptr-checks
-    // and StorageShape::GetDimNum semantic surprises (see earlier commits), we substitute a
-    // SHAPE-COMPLIANT tensor whose content selects every token: a full-coverage arange.
-    // With sparse_block_size forced to 1 and indices = [0, 1, ..., S2-1], the existing sparse
-    // path mathematically computes dense FA. No special host/kernel dense branch is exercised
-    // for this call path; CompareShape passes naturally because the shape matches what tiling
-    // expects.
-    at::Tensor sparse_indices_passthrough;
-    int64_t effective_sparse_block_size = sparse_block_size;
-    if (sparse_indices.has_value()) {
-        sparse_indices_passthrough = sparse_indices.value();
-    } else {
-        // Compute S2 (max KV seq length) and N2 per layout_kv
-        int64_t S2;
-        int64_t N2;
-        if (layout_kv_str == "PA_BSND") {
-            TORCH_CHECK(block_table.has_value(),
-                        "sparse_flash_attention: PA_BSND mode requires block_table");
-            int64_t block_size = key.size(1);              // [block_num, block_size, N2, D]
-            int64_t max_blocks_per_batch = block_table.value().size(1);
-            S2 = max_blocks_per_batch * block_size;
-            N2 = key.size(2);
-        } else if (layout_kv_str == "TND") {
-            S2 = key.size(0);                              // [T2, N2, D]
-            N2 = key.size(1);
-        } else {                                            // BSND
-            S2 = key.size(1);                              // [B, S2, N2, D]
-            N2 = key.size(2);
-        }
-        TORCH_CHECK(S2 > 0 && N2 > 0,
-                    "sparse_flash_attention dense substitute: S2=", S2, " N2=", N2);
-        effective_sparse_block_size = 1;
-        int64_t K = S2;
-
-        auto arange = at::arange(K, query.options().dtype(at::kInt));
-        if (layout_query_str == "TND") {
-            int64_t T1 = query.size(0);
-            sparse_indices_passthrough =
-                arange.view({1, 1, K}).expand({T1, N2, K}).contiguous();
-        } else {                                            // BSND
-            int64_t B = query.size(0);
-            int64_t S1 = query.size(1);
-            sparse_indices_passthrough =
-                arange.view({1, 1, 1, K}).expand({B, S1, N2, K}).contiguous();
-        }
-    }
+    // dense(sparse_indices=None) 时按 OPTIONAL 直接透传 null：
+    //   tiling 端 isDenseMode=(tensor==nullptr) 走 IS_DENSE / C_TEMPLATE 路径，
+    //   sparseBlockSize 由 host 强制为 1、sparseBlockCount=s2Size（见 SFAInfoParser::Parse）。
+    // 之前的 arange full-coverage dummy 是漏 source set_env.bash 时的误修，且每次现场
+    //   at::arange().expand().contiguous() 造 [B,S1,N2,S2] int32 张量（4~8MB/call），现去除。
+    // C_TEMPLATE/dense 路径正确性见 STEP3_DENSE_KERNEL_FIX.md（vs CPU golden 1.7e-5）。
 
     // [step 4] packed KV 输出。OPTIONAL：return_packed_kv=false 时传 nullopt、不分配显存。
     // actual_packed_len 不由算子输出，框架用 sparse_indices + causal 自算。
@@ -158,14 +117,14 @@ npu_sparse_flash_attention(
         query,
         key,
         value,
-        sparse_indices_passthrough,
+        sparse_indices,
         block_table,
         actual_seq_lengths_query,
         actual_seq_lengths_kv,
         query_rope,
         key_rope,
         scale_value,
-        effective_sparse_block_size,
+        sparse_block_size,
         layout_query_ptr,
         layout_kv_ptr,
         sparse_mode,
