@@ -12,10 +12,17 @@
 #
 # Step 3c dense-mode correctness test.
 #
-# Compare the dense path (sparse_indices=None) against the sparse path with all-blocks-selected
-# sparse_indices on the same kernel binary. With sparse_block_size=1 and K=S2, the sparse path
-# walks tokens 0..S2-1 in order; the dense path walks the same range. Their attn_out must match
-# up to fp16 rounding noise.
+# Compare the dense path (sparse_indices=None) against an all-blocks-selected sparse baseline.
+# IMPORTANT: the baseline uses sparse_block_size=8 so it runs on C_TEMPLATE (same template family
+# as dense). It must NOT use sparse_block_size=1: that runs V_TEMPLATE, whose mm2 reads K from the
+# merge workspace instead of V (P×K bug, see STEP3_DENSE_KERNEL_FIX.md). With key != value the
+# block_size=1 baseline is itself wrong, so it cannot validate dense.
+#
+# Both runs walk tokens 0..S2-1 and read valueGm; attn_out must match up to fp16 noise.
+#
+# PRECONDITION: dense (None) only reaches C_TEMPLATE after the torch_adpt arange dummy is removed
+# (re-apply 898c895b). With the dummy present, None -> arange -> V_TEMPLATE and this test fails by
+# design (proving dense currently does NOT take the real IS_DENSE path).
 #
 # Covers two layouts:
 #   - BSND / BSND        : exercises the BSND+BSND key/value offset path (no block table)
@@ -38,12 +45,13 @@ SCALE = 1.0 / (576 ** 0.5)
 
 def _call_op(query, key, value, sparse_indices, *,
              block_table, actual_seq_q, actual_seq_kv,
-             query_rope, key_rope, layout_query, layout_kv):
+             query_rope, key_rope, layout_query, layout_kv,
+             sparse_block_size=1):
     return torch.ops._C_ascend.npu_sparse_flash_attention(
         query=query, key=key, value=value,
         sparse_indices=sparse_indices,
         scale_value=SCALE,
-        sparse_block_size=1,
+        sparse_block_size=sparse_block_size,
         block_table=block_table,
         actual_seq_lengths_query=actual_seq_q,
         actual_seq_lengths_kv=actual_seq_kv,
@@ -66,11 +74,13 @@ def _make_bsnd_case():
     key_rope = (torch.randn(B, S2, N2, ROPE, dtype=dtype, device=device) * 0.1)
     actual_seq_q = torch.tensor([S1, S1], dtype=torch.int32, device=device)
     actual_seq_kv = torch.tensor([S2, S2], dtype=torch.int32, device=device)
-    # 全选 sparse_indices：每 [b, s1, n2, :] = [0,1,...,S2-1]
+    # baseline 全选 sparse_indices：block_size=8 走 C_TEMPLATE（读 valueGm，算 P×V，正确）。
+    # 不能用 block_size=1（走 V_TEMPLATE，mm2 误读 K 当 V，key≠value 时算成 P×K）。
+    # S2=128 可被 8 整除：16 个 block 全选覆盖 token 0..127。
     sparse_indices_full = (
-        torch.arange(S2, dtype=torch.int32, device=device)
-        .view(1, 1, 1, S2)
-        .expand(B, S1, N2, S2)
+        torch.arange(S2 // 8, dtype=torch.int32, device=device)
+        .view(1, 1, 1, S2 // 8)
+        .expand(B, S1, N2, S2 // 8)
         .contiguous()
     )
     return dict(
@@ -105,10 +115,11 @@ def _make_pa_bsnd_case():
     actual_seq_q = torch.tensor([S1, S1], dtype=torch.int32, device=device)
     actual_seq_kv = torch.tensor([S2, S2], dtype=torch.int32, device=device)
 
+    # baseline 用 block_size=8 走 C_TEMPLATE（PA block_size=64 % 8 == 0，合法）。
     sparse_indices_full = (
-        torch.arange(S2, dtype=torch.int32, device=device)
-        .view(1, 1, 1, S2)
-        .expand(B, S1, N2, S2)
+        torch.arange(S2 // 8, dtype=torch.int32, device=device)
+        .view(1, 1, 1, S2 // 8)
+        .expand(B, S1, N2, S2 // 8)
         .contiguous()
     )
     return dict(
@@ -127,20 +138,22 @@ def _run_pair_and_compare(case, tag):
         "actual_seq_q", "actual_seq_kv",
         "query_rope", "key_rope", "layout_query", "layout_kv")}
 
-    # Run A: sparse 路径 + 全选 indices
-    out_sparse = _call_op(sparse_indices=case["sparse_indices_full"], **common_kwargs)[0]
+    # Run A: baseline = block_size=8 全选 -> C_TEMPLATE（isDense=false，读 valueGm，正确 P×V）
+    out_sparse = _call_op(sparse_indices=case["sparse_indices_full"],
+                          sparse_block_size=8, **common_kwargs)[0]
     torch.npu.synchronize()
 
-    # Run B: dense 路径
+    # Run B: dense 路径（None）-> C_TEMPLATE（isDense=true）。需先去掉 torch_adpt 的 arange dummy，
+    # 否则 None 被 arange 拦截走 V_TEMPLATE。两者都走 C_TEMPLATE 读 valueGm，key≠value 也应一致。
     out_dense = _call_op(sparse_indices=None, **common_kwargs)[0]
     torch.npu.synchronize()
 
     out_sparse_cpu = out_sparse.float().cpu()
     out_dense_cpu = out_dense.float().cpu()
     max_abs = (out_dense_cpu - out_sparse_cpu).abs().max().item()
-    print(f"[{tag}] max_abs_diff(dense, sparse-full) = {max_abs:.6e}")
+    print(f"[{tag}] max_abs_diff(dense, C_TEMPLATE bs=8) = {max_abs:.6e}")
     assert torch.allclose(out_dense_cpu, out_sparse_cpu, rtol=1e-3, atol=1e-3), \
-        f"[{tag}] dense vs sparse-full mismatch: max_abs_diff={max_abs:.6e}"
+        f"[{tag}] dense vs C_TEMPLATE bs=8 mismatch: max_abs_diff={max_abs:.6e}"
 
 
 @pytest.mark.step3c_dense
