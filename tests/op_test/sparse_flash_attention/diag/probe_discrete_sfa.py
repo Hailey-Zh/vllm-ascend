@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Minimal standalone probe for SparseFlashAttention discrete sparse_indices.
 
-No vllm / no HuggingFace / no pytest / no forward_context / no paging. Mirrors
-the op author's aclnn example (csrc/.../examples/test_aclnn_sparse_flash_attention.cpp):
-contiguous BSND layout, no block_table, no actual_seq_lengths.
+No vllm / no HuggingFace / no pytest / no forward_context. Mirrors the PRODUCTION
+op call (vllm_ascend/device/device_op.py): TND query + PA_BSND paged KV cache,
+N>=8 heads, sparse_block_size=1 -- the only config actually exercised on 910b.
 
-    query/key/value : (B, S, N, D)      D = 512 (nope)
-    query/key rope  : (B, S, N, Drope)  Drope = 64
-    sparse_indices  : (B, Sq, N, K)     int32, token ids into [0, Skv)
+    query / query_rope : (T, N, D) / (T, N, Drope)         D=512, Drope=64
+    key / key_rope     : (num_blocks, block_size, 1, D/Drope)   (paged, PA_BSND)
+    block_table        : (batch, max_blocks) int32
+    actual_seq_lengths_query : cumulative (TND), _kv : raw per-batch
+    sparse_indices     : (T, 1, K) int32, token ids into [0, seq_len)
 
 Run:  python3 probe_discrete_sfa.py
-Prints before/after each op call so a device segfault is attributable. The
-FIRST call is COMPACTED (legacy, known-good); if that crashes the inputs/env
-are wrong, not the discrete change.
+COMPACTED first (known-good); if that crashes the inputs/env are wrong, not the
+discrete change.
 """
 
 import math
@@ -25,11 +26,11 @@ from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
 
-B, N = 1, 1            # batch, heads (example uses N=1)
-SQ = 1                 # query tokens (decode)
-SKV = 8                # kv sequence length
+NUM_HEADS = 8          # query heads (MQA: 1 kv head); production uses >=8
 D = 512                # nope dim
 DROPE = 64             # rope dim
+BLOCK_SIZE = 128
+SEQ_LEN = 64           # single decode request
 K = 8                  # topk width (sparse_indices last dim)
 DTYPE = torch.bfloat16
 
@@ -40,23 +41,33 @@ def log(*a):
 
 def build(device):
     torch.manual_seed(0)
-    query = torch.randn(B, SQ, N, D, dtype=DTYPE, device=device)
-    key = torch.randn(B, SKV, N, D, dtype=DTYPE, device=device)
-    value = key  # MLA: value == key_nope
-    query_rope = torch.randn(B, SQ, N, DROPE, dtype=DTYPE, device=device)
-    key_rope = torch.randn(B, SKV, N, DROPE, dtype=DTYPE, device=device)
+    # dense per-batch K (for golden) + paged cache (block 0 reserved, block 1 holds tokens)
+    k_nope_dense = torch.randn(SEQ_LEN, D, dtype=DTYPE, device=device)
+    k_rope_dense = torch.randn(SEQ_LEN, DROPE, dtype=DTYPE, device=device)
+    total_blocks = 2
+    k_nope_cache = torch.zeros(total_blocks, BLOCK_SIZE, 1, D, dtype=DTYPE, device=device)
+    k_rope_cache = torch.zeros(total_blocks, BLOCK_SIZE, 1, DROPE, dtype=DTYPE, device=device)
+    k_nope_cache[1, :SEQ_LEN, 0, :] = k_nope_dense
+    k_rope_cache[1, :SEQ_LEN, 0, :] = k_rope_dense
+    block_table = torch.tensor([[1]], dtype=torch.int32, device=device)
+
+    ql_nope = torch.randn(1, NUM_HEADS, D, dtype=DTYPE, device=device)        # TND: (T=1, N, D)
+    q_pe = torch.randn(1, NUM_HEADS, DROPE, dtype=DTYPE, device=device)
+    cum_q = torch.tensor([1], dtype=torch.int32, device=device)               # TND prefix sum
+    seq_kv = torch.tensor([SEQ_LEN], dtype=torch.int32, device=device)        # raw per-batch
     scale = 1.0 / math.sqrt(D + DROPE)
-    return dict(query=query, key=key, value=value, query_rope=query_rope,
-                key_rope=key_rope, scale=scale)
+    return dict(ql_nope=ql_nope, q_pe=q_pe, k_nope_cache=k_nope_cache, k_rope_cache=k_rope_cache,
+                block_table=block_table, cum_q=cum_q, seq_kv=seq_kv, scale=scale,
+                k_nope_dense=k_nope_dense, k_rope_dense=k_rope_dense)
 
 
 def run_op(t, topk, discrete):
     out, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
-        query=t["query"], key=t["key"], value=t["value"],
+        query=t["ql_nope"], key=t["k_nope_cache"], value=t["k_nope_cache"],
         sparse_indices=topk, scale_value=t["scale"], sparse_block_size=1,
-        query_rope=t["query_rope"], key_rope=t["key_rope"],
-        layout_query="BSND", layout_kv="BSND",
-        sparse_mode=3, attention_mode=2,
+        block_table=t["block_table"], actual_seq_lengths_query=t["cum_q"],
+        actual_seq_lengths_kv=t["seq_kv"], query_rope=t["q_pe"], key_rope=t["k_rope_cache"],
+        layout_query="TND", layout_kv="PA_BSND", sparse_mode=3, attention_mode=2,
         sparse_indices_discrete=discrete,
     )
     torch.npu.synchronize()
@@ -64,35 +75,36 @@ def run_op(t, topk, discrete):
 
 
 def compacted_topk(sel, device):
-    topk = torch.full((B, SQ, N, K), -1, dtype=torch.int32, device=device)
-    topk[0, 0, 0, : len(sel)] = torch.tensor(sel, dtype=torch.int32, device=device)
+    topk = torch.full((1, 1, K), -1, dtype=torch.int32, device=device)
+    topk[0, 0, : len(sel)] = torch.tensor(sel, dtype=torch.int32, device=device)
     return topk
 
 
 def scatter_topk(sel, device):
-    topk = torch.full((B, SQ, N, K), -1, dtype=torch.int32, device=device)
+    topk = torch.full((1, 1, K), -1, dtype=torch.int32, device=device)
     for k, tok in enumerate(sel):
-        topk[0, 0, 0, 2 * k] = tok  # hole before/between each id
+        topk[0, 0, 2 * k] = tok
     return topk
 
 
 def cpu_golden(t, sel):
-    key = t["key"][0, sel, 0, :].float()         # (M, 512)
-    key_rope = t["key_rope"][0, sel, 0, :].float()  # (M, 64)
-    Kmat = torch.cat([key, key_rope], dim=-1)    # (M, 576)
-    V = t["value"][0, sel, 0, :].float()         # (M, 512)
-    Q = torch.cat([t["query"][0, 0, 0, :].float(), t["query_rope"][0, 0, 0, :].float()], dim=-1)
-    attn = torch.softmax((Q @ Kmat.transpose(0, 1)) * t["scale"], dim=-1)
-    return (attn @ V)  # (512,)
+    Kmat = torch.cat([t["k_nope_dense"][sel].float(), t["k_rope_dense"][sel].float()], dim=-1)  # (M,576)
+    V = t["k_nope_dense"][sel].float()
+    outs = []
+    for h in range(NUM_HEADS):
+        Q = torch.cat([t["ql_nope"][0, h].float(), t["q_pe"][0, h].float()], dim=-1)
+        attn = torch.softmax((Q @ Kmat.transpose(0, 1)) * t["scale"], dim=-1)
+        outs.append(attn @ V)
+    return torch.stack(outs, dim=0)  # (N, 512)
 
 
 def main():
     log("torch", torch.__version__, "| npu:", torch.npu.is_available())
     device = torch.device("npu")
     t = build(device)
-    log("inputs built. query", tuple(t["query"].shape), "key", tuple(t["key"].shape))
+    log("inputs built. q", tuple(t["ql_nope"].shape), "kv_cache", tuple(t["k_nope_cache"].shape))
 
-    sel = [1, 3, 4, 6]  # 4 selected token ids in [0, 8); scattered slots 0,2,4,6 < K
+    sel = [3, 17, 40, 61]  # 4 token ids in [0,64); scattered slots 0,2,4,6 < K
     log("selected ids:", sel)
 
     log(">>> COMPACTED (discrete=False) ...")
@@ -103,9 +115,9 @@ def main():
     out_d = run_op(t, scatter_topk(sel, device), discrete=True)
     log("DISCRETE ok. out", tuple(out_d.shape))
 
-    gold = cpu_golden(t, sel)
-    od = out_d.reshape(-1)[:D].float()
-    oc = out_c.reshape(-1)[:D].float()
+    gold = cpu_golden(t, sel)                       # (N, 512)
+    od = out_d.reshape(NUM_HEADS, D).float()
+    oc = out_c.reshape(NUM_HEADS, D).float()
     dc = (od - oc).abs().amax().item()
     dg = (od - gold).abs().amax().item()
     peak = gold.abs().amax().item()
