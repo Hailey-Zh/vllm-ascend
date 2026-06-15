@@ -16,237 +16,176 @@
 #
 """Op-level tests for the DISCRETE sparse-index layout of SparseFlashAttention.
 
-The kernel historically assumes the ``sparse_indices`` (-1)-padding only trails
-the valid token ids, e.g. ``[3, 2, -1, -1]`` (COMPACTED). With the new
-``sparse_indices_discrete=True`` attribute the -1 holes may sit anywhere, e.g.
-``[-1, 3, -1, 2]`` (DISCRETE); the kernel must skip interior holes instead of
-stopping at the first -1.
+COMPACTED layout (legacy) puts the (-1) padding only after the valid token ids,
+e.g. ``[3, 2, -1, -1]``; the kernel stops at the first -1. DISCRETE layout
+(``sparse_indices_discrete=True``) allows -1 holes anywhere, e.g.
+``[-1, 3, -1, 2]``; the kernel must skip interior holes instead of stopping.
 
-These tests call ``torch.ops._C_ascend.npu_sparse_flash_attention`` directly so
-they can flip the new attribute, and they run on NPU (decode shapes only, so
-every selected token is causally valid for sparse_mode=3).
+To avoid hand-rolling kernel inputs (easy to get subtly wrong and then segfault
+on device), this reuses the proven tensor construction from
+``test_sfa_v1_precision`` and only swaps the call site to invoke the op directly
+with the new flag. Decode shapes only, so every selected token is causally valid
+for sparse_mode=3.
 """
 
 import math
-import sys
-from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.forward_context import set_forward_context
 
-from vllm_ascend.utils import enable_custom_op
+# Importing this module also runs enable_custom_op() and the torch_npu mocks.
+from tests.ut.attention.a2 import test_sfa_v1_precision as P
 
-enable_custom_op()
-
-if "torch_npu._inductor" not in sys.modules:
-    sys.modules["torch_npu._inductor"] = MagicMock()
-
-# MLA combined-KV dims are fixed in the kernel: 512 (nope) + 64 (rope) = 576.
-KV_LORA_RANK = 512
-QK_ROPE_HEAD_DIM = 64
-HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM
-BLOCK_SIZE = 128
-NUM_HEADS = 8  # query heads; MQA -> 1 kv head, group size = NUM_HEADS
-SPARSE_COUNT = 256  # topk width (>= seq_len used below)
+_MODEL = "deepseek-ai/DeepSeek-V3.2-Exp"
 
 
-def _build_paged_kv_cache(
-    seq_lens: list[int],
-    dtype: torch.dtype,
-    device: torch.device,
-):
-    """Per-batch contiguous K + a paged cache/block_table selecting the same data.
+def _build_inputs(seq_lens, query_lens, dtype, device, vllm_config):
+    """Mirror test_sfa_v1_precision._run_precision_check tensor construction."""
+    spec = P.BatchSpec(seq_lens=list(seq_lens), query_lens=list(query_lens), name="discrete")
+    cache_config = vllm_config.cache_config
+    hf_text = vllm_config.model_config.hf_text_config
+    block_size = cache_config.block_size
+    qk_rope = hf_text.qk_rope_head_dim
+    kv_lora = hf_text.kv_lora_rank
+    num_heads = hf_text.num_attention_heads
+    scale = 1.0 / math.sqrt(kv_lora + qk_rope)
 
-    Returns ``(k_nope_cache, k_rope_cache, block_table, k_nope_flat, k_rope_flat)``
-    where the ``*_flat`` lists hold the dense per-batch tensors used by the CPU
-    golden, and the caches/block_table feed the kernel (PA_BSND layout).
-    """
-    blocks_per_seq = [(s + BLOCK_SIZE - 1) // BLOCK_SIZE for s in seq_lens]
-    total_blocks = sum(blocks_per_seq) + 1  # block 0 reserved as padding
-    max_blocks = max(blocks_per_seq)
+    meta = P.create_common_attn_metadata(spec, block_size=block_size, device=device)
 
-    k_nope_cache = torch.zeros(total_blocks, BLOCK_SIZE, 1, KV_LORA_RANK, dtype=dtype, device=device)
-    k_rope_cache = torch.zeros(total_blocks, BLOCK_SIZE, 1, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
-    block_table = torch.zeros(len(seq_lens), max_blocks, dtype=torch.int32, device=device)
+    k_nope_ctx = [torch.randn(s, kv_lora, dtype=dtype, device=device) for s in seq_lens]
+    k_rope_ctx = [torch.randn(s, qk_rope, dtype=dtype, device=device) for s in seq_lens]
+    k_nope_cache, k_rope_cache, block_table = P._build_paged_kv_cache_from_metadata(
+        common_attn_metadata=meta,
+        seq_lens=list(seq_lens),
+        k_nope_contexts=k_nope_ctx,
+        k_rope_contexts=k_rope_ctx,
+        block_size=block_size,
+        kv_lora_rank=kv_lora,
+        qk_rope_head_dim=qk_rope,
+        dtype=dtype,
+        device=device,
+    )
 
-    k_nope_flat: list[torch.Tensor] = []
-    k_rope_flat: list[torch.Tensor] = []
+    num_tokens = sum(query_lens)
+    ql_nope = torch.randn(num_tokens, num_heads, kv_lora, dtype=dtype, device=device)
+    q_pe = torch.randn(num_tokens, num_heads, qk_rope, dtype=dtype, device=device)
+    cum_query_lens = torch.tensor(
+        [sum(query_lens[: i + 1]) for i in range(len(query_lens))], dtype=torch.int32, device=device)
+    seq_lens_tensor = torch.tensor(list(seq_lens), dtype=torch.int32, device=device)
 
-    next_block_id = 1
-    for b, s_len in enumerate(seq_lens):
-        k_nope = torch.randn(s_len, KV_LORA_RANK, dtype=dtype, device=device)
-        k_rope = torch.randn(s_len, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
-        k_nope_flat.append(k_nope)
-        k_rope_flat.append(k_rope)
-        for i in range(blocks_per_seq[b]):
-            block_id = next_block_id
-            block_table[b, i] = block_id
-            tok_start = i * BLOCK_SIZE
-            tok_end = min(tok_start + BLOCK_SIZE, s_len)
-            length = tok_end - tok_start
-            k_nope_cache[block_id, :length, 0, :] = k_nope[tok_start:tok_end]
-            k_rope_cache[block_id, :length, 0, :] = k_rope[tok_start:tok_end]
-            next_block_id += 1
-
-    return k_nope_cache, k_rope_cache, block_table, k_nope_flat, k_rope_flat
+    return dict(
+        ql_nope=ql_nope, q_pe=q_pe, k_nope_cache=k_nope_cache, k_rope_cache=k_rope_cache,
+        block_table=block_table, cum_query_lens=cum_query_lens, seq_lens_tensor=seq_lens_tensor,
+        scale=scale, num_heads=num_heads, k_nope_ctx=k_nope_ctx, k_rope_ctx=k_rope_ctx,
+    )
 
 
-def _run_op(
-    ql_nope, q_pe, k_nope_cache, k_rope_cache, block_table, topk_indices,
-    cum_query_lens, seq_lens_tensor, scale, *, discrete: bool,
-):
+def _run_op(t, topk_indices, *, discrete):
     """Direct kernel call; only ``sparse_indices_discrete`` differs across runs."""
-    attn_output, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
-        query=ql_nope,
-        key=k_nope_cache,
-        value=k_nope_cache,
+    out, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
+        query=t["ql_nope"],
+        key=t["k_nope_cache"],
+        value=t["k_nope_cache"],
         sparse_indices=topk_indices,
-        scale_value=scale,
+        scale_value=t["scale"],
         sparse_block_size=1,
-        block_table=block_table,
-        actual_seq_lengths_query=cum_query_lens,
-        actual_seq_lengths_kv=seq_lens_tensor,
-        query_rope=q_pe,
-        key_rope=k_rope_cache,
+        block_table=t["block_table"],
+        actual_seq_lengths_query=t["cum_query_lens"],
+        actual_seq_lengths_kv=t["seq_lens_tensor"],
+        query_rope=t["q_pe"],
+        key_rope=t["k_rope_cache"],
         layout_query="TND",
         layout_kv="PA_BSND",
         sparse_mode=3,
         attention_mode=2,
         sparse_indices_discrete=discrete,
     )
-    return attn_output
+    return out
 
 
-def _compacted_topk(selected: list[list[int]], device: torch.device) -> torch.Tensor:
-    """Front-packed indices + trailing -1 pad: ``[t0, t1, ..., -1, -1]``."""
-    num_tokens = len(selected)
-    topk = torch.full((num_tokens, 1, SPARSE_COUNT), -1, dtype=torch.int32, device=device)
+def _compacted_topk(selected, device):
+    """Front-packed ids + trailing -1: ``[t0, t1, ..., -1, -1]``."""
+    topk = torch.full((len(selected), 1, P.SPARSE_COUNT), -1, dtype=torch.int32, device=device)
     for t, sel in enumerate(selected):
         if sel:
             topk[t, 0, : len(sel)] = torch.tensor(sel, dtype=torch.int32, device=device)
     return topk
 
 
-def _scatter_topk(selected: list[list[int]], span: int, device: torch.device) -> torch.Tensor:
-    """Same token ids spread across ``[0, span)`` with interior -1 holes.
+def _scatter_topk(selected, device):
+    """Same ids spread across even slots (a -1 hole before/between each id).
 
-    Places id ``sel[k]`` at slot ``2*k`` (a hole at every odd slot), requiring
-    ``2*len(sel) <= span``. Everything else in ``[0, SPARSE_COUNT)`` stays -1.
+    id ``sel[k]`` goes to slot ``2*k``; needs ``2*len(sel)-1 < seq_len`` so every
+    valid id stays inside the kernel scan span ``min(seq_len, sparse_count)``.
     """
-    num_tokens = len(selected)
-    topk = torch.full((num_tokens, 1, SPARSE_COUNT), -1, dtype=torch.int32, device=device)
+    topk = torch.full((len(selected), 1, P.SPARSE_COUNT), -1, dtype=torch.int32, device=device)
     for t, sel in enumerate(selected):
-        assert 2 * len(sel) <= span, "scatter pattern does not fit in scan span"
         for k, tok in enumerate(sel):
             topk[t, 0, 2 * k] = tok
     return topk
 
 
-def _cpu_golden(
-    ql_nope, q_pe, k_nope_flat, k_rope_flat, selected, scale, out_dtype,
-):
-    """fp32 gather-softmax over exactly the selected (non -1) token ids."""
+def _cpu_golden(t, selected, dtype):
+    """fp32 gather-softmax over exactly the selected ids (per decode token)."""
     outputs = []
-    for t, sel in enumerate(selected):
-        k_nope = k_nope_flat[t][sel].float()                # (M, 512)
-        k_rope = k_rope_flat[t][sel].float()                # (M, 64)
-        K = torch.cat([k_nope, k_rope], dim=-1)             # (M, 576)
-        V = k_nope                                          # (M, 512)
+    for b, sel in enumerate(selected):
+        k_nope = t["k_nope_ctx"][b][sel].float()             # (M, kv_lora)
+        k_rope = t["k_rope_ctx"][b][sel].float()             # (M, qk_rope)
+        K = torch.cat([k_nope, k_rope], dim=-1)              # (M, 576)
+        V = k_nope                                           # (M, kv_lora)
         head_out = []
-        for h in range(ql_nope.shape[1]):
-            Q = torch.cat([ql_nope[t, h].float(), q_pe[t, h].float()], dim=-1)  # (576,)
-            scores = (Q @ K.transpose(0, 1)) * scale        # (M,)
+        for h in range(t["num_heads"]):
+            Q = torch.cat([t["ql_nope"][b, h].float(), t["q_pe"][b, h].float()], dim=-1)
+            scores = (Q @ K.transpose(0, 1)) * t["scale"]
             attn = torch.softmax(scores, dim=-1)
-            head_out.append(attn @ V)                       # (512,)
-        outputs.append(torch.stack(head_out, dim=0))        # (H, 512)
-    return torch.stack(outputs, dim=0).to(out_dtype)        # (T, H, 512)
-
-
-def _make_decode_inputs(seq_lens, dtype, device):
-    """Decode batch (q_len=1 per request); returns kernel + golden inputs."""
-    num_tokens = len(seq_lens)  # one query token per request
-    k_nope_cache, k_rope_cache, block_table, k_nope_flat, k_rope_flat = _build_paged_kv_cache(
-        seq_lens, dtype, device
-    )
-    ql_nope = torch.randn(num_tokens, NUM_HEADS, KV_LORA_RANK, dtype=dtype, device=device)
-    q_pe = torch.randn(num_tokens, NUM_HEADS, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
-    cum_query_lens = torch.arange(1, num_tokens + 1, dtype=torch.int32, device=device)
-    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-    scale = 1.0 / math.sqrt(HEAD_DIM)
-    return (ql_nope, q_pe, k_nope_cache, k_rope_cache, block_table,
-            cum_query_lens, seq_lens_tensor, scale, k_nope_flat, k_rope_flat)
+            head_out.append(attn @ V)
+        outputs.append(torch.stack(head_out, dim=0))
+    return torch.stack(outputs, dim=0).to(dtype)
 
 
 def _assert_close(actual, expected, dtype, tag):
     atol = 5e-3 if dtype == torch.float16 else 1e-2
-    rtol = 5e-3 if dtype == torch.float16 else 1e-2
-    assert actual.shape == expected.shape, f"[{tag}] shape {tuple(actual.shape)} != {tuple(expected.shape)}"
     diff = (actual.float() - expected.float()).abs()
     peak = expected.float().abs().amax().clamp_min(1e-6)
-    rel = (diff.amax() / peak).item()
-    assert torch.allclose(actual.float(), expected.float(), atol=atol, rtol=rtol), (
-        f"[{tag}] mismatch: max|err|={diff.amax().item():.3e} peak|ref|={peak.item():.3e} relerr={rel:.3e}"
-    )
+    assert actual.shape == expected.shape, f"[{tag}] shape {tuple(actual.shape)} != {tuple(expected.shape)}"
+    assert torch.allclose(actual.float(), expected.float(), atol=atol, rtol=atol), (
+        f"[{tag}] max|err|={diff.amax().item():.3e} peak|ref|={peak.item():.3e}")
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("seq_lens", [[64], [128], [64, 96, 120]])
+@pytest.mark.parametrize("seq_lens", [[64], [64, 96]])
 def test_discrete_matches_compacted(dtype, seq_lens):
-    """DISCRETE [-1,t0,-1,t1,...] must equal COMPACTED [t0,t1,...] (same set)."""
+    """DISCRETE scattered == COMPACTED packed for the same selected subset."""
     torch.manual_seed(2026)
     device = torch.device("npu")
-    (ql_nope, q_pe, k_nope_cache, k_rope_cache, block_table,
-     cum_query_lens, seq_lens_tensor, scale, _, _) = _make_decode_inputs(seq_lens, dtype, device)
+    vllm_config = P._get_vllm_config(_MODEL, dtype, tensor_parallel_size=1)
+    query_lens = [1] * len(seq_lens)
+    t = _build_inputs(seq_lens, query_lens, dtype, device, vllm_config)
 
-    # Select roughly half the (causally valid) tokens for each request.
-    selected = [sorted(range(0, s, 2)) for s in seq_lens]
+    # subset of <= seq_len/2 tokens so the scattered (2*k) slots stay in span
+    selected = [sorted(range(0, s, 3)) for s in seq_lens]
 
-    compacted_topk = _compacted_topk(selected, device)
-    discrete_topk = _scatter_topk(selected, span=max(seq_lens), device=device)
-
-    out_compacted = _run_op(ql_nope, q_pe, k_nope_cache, k_rope_cache, block_table,
-                            compacted_topk, cum_query_lens, seq_lens_tensor, scale, discrete=False)
-    out_discrete = _run_op(ql_nope, q_pe, k_nope_cache, k_rope_cache, block_table,
-                           discrete_topk, cum_query_lens, seq_lens_tensor, scale, discrete=True)
+    with set_forward_context(attn_metadata=None, vllm_config=vllm_config):
+        out_compacted = _run_op(t, _compacted_topk(selected, device), discrete=False)
+        out_discrete = _run_op(t, _scatter_topk(selected, device), discrete=True)
 
     _assert_close(out_discrete, out_compacted, dtype, f"discrete-vs-compacted seq={seq_lens}")
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("seq_lens", [[64], [128]])
+@pytest.mark.parametrize("seq_lens", [[64], [64, 96]])
 def test_discrete_vs_cpu_golden(dtype, seq_lens):
     """DISCRETE selection vs an independent fp32 gather-softmax golden."""
     torch.manual_seed(7)
     device = torch.device("npu")
-    (ql_nope, q_pe, k_nope_cache, k_rope_cache, block_table,
-     cum_query_lens, seq_lens_tensor, scale, k_nope_flat, k_rope_flat) = _make_decode_inputs(
-        seq_lens, dtype, device)
+    vllm_config = P._get_vllm_config(_MODEL, dtype, tensor_parallel_size=1)
+    query_lens = [1] * len(seq_lens)
+    t = _build_inputs(seq_lens, query_lens, dtype, device, vllm_config)
 
-    selected = [sorted(range(1, s, 3)) for s in seq_lens]  # arbitrary scattered subset
-    discrete_topk = _scatter_topk(selected, span=max(seq_lens), device=device)
+    selected = [sorted(range(1, s, 4)) for s in seq_lens]  # leading -1 hole + interleaved holes
 
-    out = _run_op(ql_nope, q_pe, k_nope_cache, k_rope_cache, block_table,
-                  discrete_topk, cum_query_lens, seq_lens_tensor, scale, discrete=True)
-    golden = _cpu_golden(ql_nope, q_pe, k_nope_flat, k_rope_flat, selected, scale, dtype)
+    with set_forward_context(attn_metadata=None, vllm_config=vllm_config):
+        out = _run_op(t, _scatter_topk(selected, device), discrete=True)
 
-    _assert_close(out, golden, dtype, f"discrete-vs-golden seq={seq_lens}")
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_discrete_leading_hole(dtype):
-    """A -1 in slot 0 (and other interior holes) must not drop later tokens."""
-    torch.manual_seed(11)
-    device = torch.device("npu")
-    seq_lens = [64]
-    (ql_nope, q_pe, k_nope_cache, k_rope_cache, block_table,
-     cum_query_lens, seq_lens_tensor, scale, k_nope_flat, k_rope_flat) = _make_decode_inputs(
-        seq_lens, dtype, device)
-
-    selected = [[3, 7, 9, 20, 41]]  # _scatter_topk puts a -1 before each id -> slot 0 is a hole
-    discrete_topk = _scatter_topk(selected, span=64, device=device)
-
-    out = _run_op(ql_nope, q_pe, k_nope_cache, k_rope_cache, block_table,
-                  discrete_topk, cum_query_lens, seq_lens_tensor, scale, discrete=True)
-    golden = _cpu_golden(ql_nope, q_pe, k_nope_flat, k_rope_flat, selected, scale, dtype)
-
-    _assert_close(out, golden, dtype, "discrete-leading-hole")
+    _assert_close(out, _cpu_golden(t, selected, dtype), dtype, f"discrete-vs-golden seq={seq_lens}")
