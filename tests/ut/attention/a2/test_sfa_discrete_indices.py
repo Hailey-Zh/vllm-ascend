@@ -28,6 +28,15 @@ with the new flag. Decode shapes only, so every selected token is causally valid
 for sparse_mode=3.
 """
 
+import os
+
+# Offline NPU box: use the locally-cached HF config (the DeepSeek-V3.2 model is
+# already present for inference) instead of hitting the network, which is
+# unreachable and otherwise aborts _get_vllm_config. Must be set before any
+# transformers/vllm import below.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import math
 
 import pytest
