@@ -106,7 +106,12 @@ fi
 END=$(date +%s)
 banner "finished in $((END - START))s"
 
-SET_ENV="$REPO_ROOT/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/bin/set_env.bash"
+# Vendor dir name varies (e.g. custom_transformer); locate set_env.bash by glob.
+VENDORS_DIR="$REPO_ROOT/vllm_ascend/_cann_ops_custom/vendors"
+SET_ENV="$(ls "$VENDORS_DIR"/*/bin/set_env.bash 2>/dev/null | head -1 || true)"
+if [[ -z "$SET_ENV" ]]; then
+    SET_ENV="$VENDORS_DIR/<vendor>/bin/set_env.bash  (not found - check $VENDORS_DIR)"
+fi
 echo
 echo ">>> NEXT STEP (run in the SAME shell you use for the op / pytest):"
 echo
