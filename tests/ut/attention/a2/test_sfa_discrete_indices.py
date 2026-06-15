@@ -46,7 +46,9 @@ from vllm.forward_context import set_forward_context
 # Importing this module also runs enable_custom_op() and the torch_npu mocks.
 from tests.ut.attention.a2 import test_sfa_v1_precision as P
 
-_MODEL = "deepseek-ai/DeepSeek-V3.2-Exp"
+# Only the HF *config* (dims) is needed, no weights. Override with a local model
+# dir on an offline box, e.g. SFA_TEST_MODEL=/path/to/DeepSeek-V3.2-Exp.
+_MODEL = os.environ.get("SFA_TEST_MODEL", "deepseek-ai/DeepSeek-V3.2-Exp")
 
 
 def _build_inputs(seq_lens, query_lens, dtype, device, vllm_config):
